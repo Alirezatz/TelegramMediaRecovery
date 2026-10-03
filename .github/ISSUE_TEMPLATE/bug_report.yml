@@ -1,0 +1,57 @@
+﻿name: Bug report
+description: Something came out wrong, or something that should have been recovered was not
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This tool only ever reads the `tdata` folder, so a report can never be
+        about damaged data. Please do **not** attach `tdata` files, recovered
+        media, passcodes, or local keys.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: input
+    id: tdata
+    attributes:
+      label: tdata folder
+      placeholder: C:\Users\you\AppData\Roaming\Telegram Desktop\tdata
+    validations:
+      required: true
+  - type: dropdown
+    id: source
+    attributes:
+      label: Where does this tdata folder come from?
+      options:
+        - Telegram Desktop (official)
+        - Telegram Desktop x64
+        - 64Gram
+        - Other fork
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: App version
+      description: The "Launched version" line at the top of log.txt
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command line
+      description: Only relevant for the CLI tool
+      render: shell
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: The summary block, and any rows of skipped.csv that look wrong
+      render: shell
+    validations:
+      required: true

@@ -1,0 +1,77 @@
+name: build-and-test
+
+on:
+  push:
+    branches: [main, master, dev]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      # The WPF project can only build on Windows; Core and the CLI build anywhere.
+      - name: Build Core, CLI and tests
+        if: runner.os != 'Windows'
+        run: |
+          dotnet build src/TelegramMediaRecovery.Core/TelegramMediaRecovery.Core.csproj -c Release
+          dotnet build src/TelegramMediaRecovery.Cli/TelegramMediaRecovery.Cli.csproj -c Release
+          dotnet test tests/TelegramMediaRecovery.Core.Tests/TelegramMediaRecovery.Core.Tests.csproj -c Release
+
+      - name: Build the whole solution
+        if: runner.os == 'Windows'
+        run: dotnet build TelegramMediaRecovery.slnx -c Release
+
+      - name: Run the tests
+        if: runner.os == 'Windows'
+        run: dotnet test tests/TelegramMediaRecovery.Core.Tests/TelegramMediaRecovery.Core.Tests.csproj -c Release --logger trx --results-directory artifacts/test-results
+
+      - name: Check formatting
+        if: runner.os == 'Windows'
+        run: dotnet format --verify-no-changes --no-restore
+
+      - name: Upload test results
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: artifacts/test-results
+          if-no-files-found: ignore
+
+      - name: Publish the CLI
+        if: runner.os == 'Windows'
+        run: >
+          dotnet publish src/TelegramMediaRecovery.Cli
+          -c Release
+          -r win-x64
+          --self-contained
+          -p:PublishSingleFile=true
+          -p:DebugType=None
+          -p:DebugSymbols=false
+          -o artifacts/cli
+
+      - name: Upload the CLI
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tmr-cli-win-x64
+          path: artifacts/cli
+          if-no-files-found: ignore

@@ -1,0 +1,25 @@
+﻿# Build output
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+artifacts/
+*.user
+*.suo
+*.userprefs
+
+# IDEs
+.vs/
+.vscode/
+.idea/
+*.swp
+
+# Recovered data (never commit somebody else's media)
+recovered/
+out/
+*.tdata/
+
+# OS noise
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,10 @@
+﻿<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/TelegramMediaRecovery.Core/TelegramMediaRecovery.Core.csproj" />
+    <Project Path="src/TelegramMediaRecovery.Cli/TelegramMediaRecovery.Cli.csproj" />
+    <Project Path="src/TelegramMediaRecovery.Desktop/TelegramMediaRecovery.Desktop.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/TelegramMediaRecovery.Core.Tests/TelegramMediaRecovery.Core.Tests.csproj" />
+  </Folder>
+</Solution>

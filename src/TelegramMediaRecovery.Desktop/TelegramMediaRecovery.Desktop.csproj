@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <RootNamespace>TelegramMediaRecovery.Desktop</RootNamespace>
+    <AssemblyName>TelegramMediaRecovery</AssemblyName>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\TelegramMediaRecovery.Core\TelegramMediaRecovery.Core.csproj" />
+  </ItemGroup>
+
+</Project>

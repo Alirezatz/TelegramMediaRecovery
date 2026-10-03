@@ -1,0 +1,52 @@
+﻿# EditorConfig: https://editorconfig.org
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{json,yml,yaml,md}]
+indent_size = 2
+
+[*.{xaml,axaml}]
+indent_size = 4
+
+[*.csproj,*.props,*.slnx,*.config}]
+indent_size = 2
+
+[*.md]
+trim_trailing_whitespace = false
+
+[*.cs]
+# usings
+dotnet_sort_system_directives_first = true
+dotnet_separate_import_directive_groups = false
+csharp_using_directive_placement = outside_namespace:suggestion
+
+# language
+csharp_style_namespace_declarations = file_scoped:suggestion
+csharp_style_var_for_built_in_types = false:suggestion
+csharp_style_var_when_type_is_apparent = true:suggestion
+csharp_style_expression_bodied_methods = when_on_single_line:suggestion
+csharp_style_expression_bodied_properties = true:suggestion
+csharp_prefer_braces = true:suggestion
+csharp_style_prefer_primary_constructors = true:suggestion
+
+# naming
+dotnet_naming_rule.private_fields_underscore.severity = suggestion
+dotnet_naming_rule.private_fields_underscore.symbols = private_fields
+dotnet_naming_rule.private_fields_underscore.style = underscore_camel
+
+dotnet_naming_symbols.private_fields.applicable_kinds = field
+dotnet_naming_symbols.private_fields.applicable_accessibilities = private
+dotnet_naming_symbols.private_fields.required_modifiers =
+
+dotnet_naming_style.underscore_camel.required_prefix =
+dotnet_naming_style.underscore_camel.capitalization = camel_case
+
+# diagnostics
+dotnet_diagnostic.CA1707.severity = none

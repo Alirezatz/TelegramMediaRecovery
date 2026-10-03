@@ -1,0 +1,8 @@
+﻿# Auto-generated Visual Studio files
+*.binlog
+*.opendb
+*.dbmdl
+*.jfm
+.vs/
+.vscode/
+.idea/
