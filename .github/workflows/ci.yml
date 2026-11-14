@@ -42,7 +42,7 @@ jobs:
 
       - name: Run the tests
         if: runner.os == 'Windows'
-        run: dotnet test tests/TelegramMediaRecovery.Core.Tests/TelegramMediaRecovery.Core.Tests.csproj -c Release --logger trx --results-directory artifacts/test-results
+        run: dotnet test TelegramMediaRecovery.slnx -c Release --no-build --logger trx --results-directory artifacts/test-results
 
       - name: Check formatting
         if: runner.os == 'Windows'

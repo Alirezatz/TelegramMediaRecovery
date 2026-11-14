@@ -1,551 +1,371 @@
 using System.Collections.ObjectModel;
-using System.Globalization;
+using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
+using System.Windows.Data;
+using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using TelegramMediaRecovery.Core;
-using TelegramMediaRecovery.Core.Cache;
-using TelegramMediaRecovery.Core.Crypto;
-using TelegramMediaRecovery.Core.Extraction;
+using TelegramMediaRecovery.Core.Browsing;
 using TelegramMediaRecovery.Core.Media;
-using TelegramMediaRecovery.Core.Reporting;
 
 namespace TelegramMediaRecovery.Desktop.ViewModels;
 
-/// <summary>
-/// Everything the main window binds to: the chosen folders, the options, the
-/// live log and the finished summary.
-/// </summary>
-public sealed class MainViewModel : ObservableObject
+/// <summary>Scan-first media browsing. Cache reading and export decisions live in RecoverySession.</summary>
+public sealed class MainViewModel : ObservableObject, IDisposable
 {
     private readonly Dispatcher _dispatcher;
-    private CancellationTokenSource? _cancellation;
+    private readonly ThumbnailLoader _thumbnails = new();
+    private readonly MediaFilter _filter = new();
+    private readonly PreviewController _previews;
+    private string? _appliedSort;
+    private bool _closing;
+    private readonly HashSet<MediaItemViewModel> _selected = [];
 
-    private string _tdataPath = DefaultTdata();
-    private string _outputPath = DefaultOutput();
+    private RecoverySession? _session;
+
+    private CancellationTokenSource? _operation;
+    private CancellationTokenSource _scanLifetime = new();
+
+    private ObservableCollection<MediaItemViewModel> _items = [];
+    private ICollectionView _itemsView;
+    private string _sourcePath = string.Empty;
     private string _passcode = string.Empty;
-    private string _accounts = string.Empty;
-    private bool _includeCache = true;
-    private bool _includeMediaCache = true;
-    private bool _keepUnknown;
-    private bool _scanOrphans = true;
-    private bool _computeHashes = true;
-    private bool _datedNames;
-    private bool _markPartials = true;
-    private bool _htmlReport = true;
-    private bool _jsonManifest;
-    private bool _verbose;
-    private bool _requireHeader;
-    private double _minimumCoverage = 0.05;
+    private string _query = string.Empty;
+    private string _kindFilter = "All types";
+    private string _usageFilter = "All usage";
+    private string _stateFilter = "All states";
+    private string _sort = "Cache date: newest first";
     private string _minimumSize = string.Empty;
     private string _maximumSize = string.Empty;
-    private int _threads;
-    private bool _isRunning;
+    private DateTime? _dateFrom;
+    private DateTime? _dateTo;
+
+    private long _selectedBytes;
+    private string _filterError = string.Empty;
+    private bool _busy;
+    private bool _hasCatalog;
+    private bool _batchSelection;
+    private bool _disposed;
     private double _progress;
-    private string _status = "Ready.";
-    private string _summary = string.Empty;
-    private LocalKey? _localKey;
-    private ExtractionReport? _report;
+    private string _status = "Choose a Telegram data directory to scan cached media.";
+    private string _catalogSummary = "Scanning reads the cache. Choose files to export after browsing.";
+    private string _lastOutput = string.Empty;
+    private MediaItemViewModel? _current;
 
-    /// <summary>Creates the view model bound to a UI dispatcher.</summary>
-    public MainViewModel(Dispatcher dispatcher) => _dispatcher = dispatcher;
+    private int _visibleCount;
 
-    /// <summary>Raised when the user asks to open a folder; the view handles it.</summary>
-    public event EventHandler<string>? OpenFolderRequested;
-
-    // ----------------------------------------------------------------- input
-
-    /// <summary>The <c>tdata</c> folder to read.</summary>
-    public string TdataPath
+    public MainViewModel(Dispatcher dispatcher)
     {
-        get => _tdataPath;
-        set => Set(ref _tdataPath, value);
+        _dispatcher = dispatcher;
+        _previews = new PreviewController(dispatcher);
+        _previews.Changing += () => PreviewChanging?.Invoke();
+        _previews.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(PreviewController.Image)) { Raise(nameof(PreviewImage)); }
+            if (e.PropertyName == nameof(PreviewController.Uri)) { Raise(nameof(PreviewUri)); Raise(nameof(HasMediaPreview)); }
+            if (e.PropertyName == nameof(PreviewController.Message)) { Raise(nameof(PreviewMessage)); }
+        };
+        _itemsView = CollectionViewSource.GetDefaultView(_items);
+        _appliedSort = null;
+        _itemsView.Filter = Matches;
+        ScanCommand = new AsyncRelayCommand(ScanAsync, () => !IsBusy && !string.IsNullOrWhiteSpace(SourcePath));
+        ExportCommand = new AsyncRelayCommand(async () =>
+        {
+            var destination = ChooseExportFolder?.Invoke();
+            if (!string.IsNullOrEmpty(destination)) { await ExportSelectedAsync(destination); }
+        }, () => !IsBusy && _selected.Count > 0);
+        CancelCommand = new RelayCommand(_ => _operation?.Cancel(), _ => IsBusy);
+        FindSourcesCommand = new RelayCommand(_ => FindSources(), _ => !IsBusy);
+        SelectVisibleCommand = new RelayCommand(_ => CheckVisible(), _ => !IsBusy && VisibleCount > 0);
+        ClearSelectionCommand = new RelayCommand(_ => ClearSelection(), _ => !IsBusy && _selected.Count > 0);
+        ResetFiltersCommand = new RelayCommand(_ => ResetFilters());
+        OpenOutputCommand = new RelayCommand(_ => OpenRequested?.Invoke(LastOutput), _ => Directory.Exists(LastOutput));
+
     }
 
-    /// <summary>Where recovered files are written.</summary>
-    public string OutputPath
+    public AsyncRelayCommand ScanCommand { get; }
+    public AsyncRelayCommand ExportCommand { get; }
+    public RelayCommand CancelCommand { get; }
+    public RelayCommand FindSourcesCommand { get; }
+    public RelayCommand SelectVisibleCommand { get; }
+    public RelayCommand ClearSelectionCommand { get; }
+    public RelayCommand ResetFiltersCommand { get; }
+    public RelayCommand OpenOutputCommand { get; }
+    public Func<string?>? ChooseExportFolder { get; set; }
+    public event Action<string>? OpenRequested;
+    public event Action? PreviewChanging;
+    public ObservableCollection<string> DetectedSources { get; } = [];
+    public ObservableCollection<string> Log { get; } = [];
+    public IReadOnlyList<string> Kinds { get; } = ["All types", "Images", "Videos", "Animated stickers", "Audio", "Documents"];
+    public IReadOnlyList<string> Usages { get; } = ["All usage", "Hide avatars and thumbnails", "Media files", "Avatars / icons", "Thumbnails / covers", "Stickers / emoji", "Unknown usage"];
+    public IReadOnlyList<string> States { get; } = ["All states", "Cache verified", "Integrity unknown", "Gaps detected"];
+    public IReadOnlyList<string> Sorts { get; } = ["Cache date: newest first", "Cache date: oldest first", "Size: largest first", "Size: smallest first", "File type"];
+    public ICollectionView ItemsView => _itemsView;
+    public IReadOnlyList<MediaItemViewModel> Items => _items;
+    public string SourcePath
     {
-        get => _outputPath;
-        set => Set(ref _outputPath, value);
+        get => _sourcePath;
+        set { if (!IsBusy && Set(ref _sourcePath, value)) { ResetCatalog(); RefreshCommands(); } }
     }
-
-    /// <summary>Local passcode; empty when none is set.</summary>
     public string Passcode
     {
         get => _passcode;
-        set => Set(ref _passcode, value);
+        set { if (!IsBusy && Set(ref _passcode, value)) { ResetCatalog(); } }
     }
-
-    /// <summary>Comma separated account filter, e.g. <c>user_data,user_data#2</c>.</summary>
-    public string Accounts
+    public bool IsBusy { get => _busy; private set { if (Set(ref _busy, value)) { Raise(nameof(CanEditSource)); RefreshCommands(); } } }
+    public bool CanEditSource => !IsBusy;
+    public bool HasCatalog { get => _hasCatalog; private set { if (Set(ref _hasCatalog, value)) { Raise(nameof(EmptyMessage)); } } }
+    public double Progress { get => _progress; private set => Set(ref _progress, value); }
+    public string Status { get => _status; private set => Set(ref _status, value); }
+    public string CatalogSummary { get => _catalogSummary; private set => Set(ref _catalogSummary, value); }
+    public string LastOutput { get => _lastOutput; private set { Set(ref _lastOutput, value); OpenOutputCommand.RaiseCanExecuteChanged(); } }
+    public int VisibleCount { get => _visibleCount; private set { Set(ref _visibleCount, value); Raise(nameof(ResultsTitle)); Raise(nameof(EmptyMessage)); } }
+    public string ResultsTitle => $"Media  {VisibleCount:N0} / {_items.Count:N0}";
+    public string EmptyMessage => !HasCatalog ? "Choose a data source and scan to see its media here."
+        : _items.Count == 0 ? "No readable media found. Check the data source and activity log."
+        : "No media matches these filters. Clear the filters to try again.";
+    public int SelectedCount => _selected.Count;
+    public string SelectionSummary
     {
-        get => _accounts;
-        set => Set(ref _accounts, value);
-    }
-
-    /// <summary>Process the <c>cache</c> database (photos, GIFs, stickers).</summary>
-    public bool IncludeCache
-    {
-        get => _includeCache;
-        set => Set(ref _includeCache, value);
-    }
-
-    /// <summary>Process the <c>media_cache</c> database (streamed video/audio).</summary>
-    public bool IncludeMediaCache
-    {
-        get => _includeMediaCache;
-        set => Set(ref _includeMediaCache, value);
-    }
-
-    /// <summary>Also save content that is not recognised as media.</summary>
-    public bool KeepUnknown
-    {
-        get => _keepUnknown;
-        set => Set(ref _keepUnknown, value);
-    }
-
-    /// <summary>Also recover TDEF files no live binlog entry references.</summary>
-    public bool ScanOrphans
-    {
-        get => _scanOrphans;
-        set => Set(ref _scanOrphans, value);
-    }
-
-    /// <summary>Hash and de-duplicate the output.</summary>
-    public bool ComputeHashes
-    {
-        get => _computeHashes;
-        set => Set(ref _computeHashes, value);
-    }
-
-    /// <summary>Prefix file names with their estimated date.</summary>
-    public bool DatedNames
-    {
-        get => _datedNames;
-        set => Set(ref _datedNames, value);
-    }
-
-    /// <summary>Mark incomplete streamed files with a <c>.partial</c> infix.</summary>
-    public bool MarkPartials
-    {
-        get => _markPartials;
-        set => Set(ref _markPartials, value);
-    }
-
-    /// <summary>Write an HTML gallery next to the recovered files.</summary>
-    public bool WriteHtmlReport
-    {
-        get => _htmlReport;
-        set => Set(ref _htmlReport, value);
-    }
-
-    /// <summary>Also write <c>manifest.json</c>.</summary>
-    public bool WriteJsonManifest
-    {
-        get => _jsonManifest;
-        set => Set(ref _jsonManifest, value);
-    }
-
-    /// <summary>Show per-file log lines.</summary>
-    public bool Verbose
-    {
-        get => _verbose;
-        set => Set(ref _verbose, value);
-    }
-
-    /// <summary>Only write streamed files whose header slice survived.</summary>
-    public bool RequireStreamHeader
-    {
-        get => _requireHeader;
-        set => Set(ref _requireHeader, value);
-    }
-
-    /// <summary>Minimum share of a streamed file that must be cached, 0..1.</summary>
-    public double MinimumCoverage
-    {
-        get => _minimumCoverage;
-        set => Set(ref _minimumCoverage, value);
-    }
-
-    /// <summary>Skip values smaller than this, e.g. <c>4KB</c>.</summary>
-    public string MinimumSize
-    {
-        get => _minimumSize;
-        set => Set(ref _minimumSize, value);
-    }
-
-    /// <summary>Skip values larger than this.</summary>
-    public string MaximumSize
-    {
-        get => _maximumSize;
-        set => Set(ref _maximumSize, value);
-    }
-
-    /// <summary>Worker threads; 0 means one per CPU.</summary>
-    public int Threads
-    {
-        get => _threads;
-        set => Set(ref _threads, value);
-    }
-
-    // ---------------------------------------------------------------- output
-
-    /// <summary>True while an extraction is running.</summary>
-    public bool IsRunning
-    {
-        get => _isRunning;
-        private set
+        get
         {
-            if (Set(ref _isRunning, value))
+            var hidden = _selected.Count(i => !Matches(i));
+            return $"Selected {_selected.Count:N0} items · Estimated {ByteSize.Format(_selectedBytes)}" + (hidden > 0 ? $" ({hidden} hidden by filters)" : string.Empty);
+        }
+    }
+    public string Query { get => _query; set { if (Set(ref _query, value)) { RefreshFilters(); } } }
+    public string KindFilter { get => _kindFilter; set { if (Set(ref _kindFilter, value)) { RefreshFilters(); } } }
+    public string UsageFilter { get => _usageFilter; set { if (Set(ref _usageFilter, value)) { RefreshFilters(); } } }
+    public string StateFilter { get => _stateFilter; set { if (Set(ref _stateFilter, value)) { RefreshFilters(); } } }
+    public string Sort { get => _sort; set { if (Set(ref _sort, value)) { RefreshFilters(); } } }
+    public string MinimumSize { get => _minimumSize; set { if (Set(ref _minimumSize, value)) { RefreshFilters(); } } }
+    public string MaximumSize { get => _maximumSize; set { if (Set(ref _maximumSize, value)) { RefreshFilters(); } } }
+    public DateTime? DateFrom { get => _dateFrom; set { if (Set(ref _dateFrom, value)) { RefreshFilters(); } } }
+    public DateTime? DateTo { get => _dateTo; set { if (Set(ref _dateTo, value)) { RefreshFilters(); } } }
+    public string FilterError { get => _filterError; private set => Set(ref _filterError, value); }
+    public MediaItemViewModel? CurrentItem
+    {
+        get => _current;
+        set
+        {
+            if (Set(ref _current, value))
             {
-                Raise(nameof(StartCommand));
-                Raise(nameof(CancelCommand));
-                Raise(nameof(ScanCommand));
+                Raise(nameof(HasCurrentItem));
+                Raise(nameof(CurrentDetails));
+                if (!_closing && value is not null && _session is not null) { CurrentPreview = _previews.ShowAsync(_session, value, _scanLifetime.Token); }
+                else { _previews.Clear(); CurrentPreview = Task.CompletedTask; }
             }
         }
     }
+    public Task CurrentPreview { get; private set; } = Task.CompletedTask;
+    public bool HasCurrentItem => CurrentItem is not null;
+    public BitmapSource? PreviewImage => _previews.Image;
+    public Uri? PreviewUri => _previews.Uri;
+    public bool HasMediaPreview => PreviewUri is not null;
+    public string PreviewMessage { get => _previews.Message; set => _previews.Message = value; }
+    public string CurrentDetails => CurrentItem is not { } item ? string.Empty
+        : $"Type  {item.Kind} · {item.Extension}\nUsage  {item.Usage}\nKnown size  {item.Size}\nEstimated cache time  {item.DateLabel}\nAccount  {item.Item.Account}\nSource  {(item.Item.IsStream ? "streaming media cache" : "media cache")}\nCached fragments  {item.Item.Fragments}\nStatus  {item.State}\nSaving restrictions  Unknown (source message not linked)";
 
-    /// <summary>Progress of the current run, 0..100.</summary>
-    public double Progress
+    public void FindSources()
     {
-        get => _progress;
-        private set => Set(ref _progress, value);
+        if (IsBusy) { return; }
+        DetectedSources.Clear();
+        foreach (var path in SourceDiscovery.Find()) { DetectedSources.Add(path); }
+        if (DetectedSources.Count == 1) { SourcePath = DetectedSources[0]; }
+        Status = DetectedSources.Count == 0 ? "No data directories found. Choose tdata or its parent directory." : $"Found {DetectedSources.Count} data sources. Select one to scan.";
     }
 
-    /// <summary>One-line status shown under the progress bar.</summary>
-    public string Status
+    public async Task ScanAsync()
     {
-        get => _status;
-        private set => Set(ref _status, value);
-    }
-
-    /// <summary>Multi-line summary shown after a run.</summary>
-    public string Summary
-    {
-        get => _summary;
-        private set => Set(ref _summary, value);
-    }
-
-    /// <summary>The activity log, newest last.</summary>
-    public ObservableCollection<LogEntry> Log { get; } = [];
-
-    /// <summary>Per-database results of the last run.</summary>
-    public ObservableCollection<DatabaseSummary> Databases { get; } = [];
-
-    /// <summary>Bytes written so far, formatted.</summary>
-    public string BytesWritten => Format(_currentBytes);
-
-    private long _currentBytes;
-
-    // -------------------------------------------------------------- commands
-
-    /// <summary>Browses for the <c>tdata</c> folder.</summary>
-    public RelayCommand BrowseTdataCommand => new(_ => BrowseForFolder(TdataPath, path => TdataPath = path));
-
-    /// <summary>Browses for the output folder.</summary>
-    public RelayCommand BrowseOutputCommand => new(_ => BrowseForFolder(OutputPath, path => OutputPath = path));
-
-    /// <summary>Reads the binlogs and reports what is inside, without writing files.</summary>
-    public RelayCommand ScanCommand => new(_ => _ = ScanAsync(), _ => !IsRunning);
-
-    /// <summary>Starts the extraction.</summary>
-    public RelayCommand StartCommand => new(_ => _ = StartAsync(), _ => !IsRunning && TdataPath.Length > 0);
-
-    /// <summary>Stops the extraction.</summary>
-    public RelayCommand CancelCommand => new(_ => _cancellation?.Cancel(), _ => IsRunning);
-
-    /// <summary>Opens the output folder in Explorer.</summary>
-    public RelayCommand OpenOutputCommand => new(_ => OpenFolderRequested?.Invoke(this, OutputPath));
-
-    /// <summary>Opens the HTML report in the default browser.</summary>
-    public RelayCommand OpenReportCommand => new(
-        _ => OpenFolderRequested?.Invoke(this, Path.Combine(OutputPath, "index.html")),
-        _ => File.Exists(Path.Combine(OutputPath, "index.html")));
-
-    // ----------------------------------------------------------------- logic
-
-    private async Task ScanAsync()
-    {
+        if (IsBusy || string.IsNullOrWhiteSpace(SourcePath)) { return; }
+        ResetCatalog();
+        using var operation = BeginOperation("Opening data source...");
+        var source = SourcePath;
+        var passcode = Passcode;
+        RecoverySession? session = null;
         try
         {
-            IsRunning = true;
-            Progress = 0;
-            Status = "Reading binlogs ...";
-
-            var report = await Task.Run(() => DescribeFolder()).ConfigureAwait(true);
-
-            foreach (var entry in report)
+            var catalog = await Task.Run(() =>
             {
-                Log.Add(entry);
-            }
-
-            Status = $"{report.Count} database version(s) readable.";
-        }
-        catch (Exception ex) when (ex is IOException or InvalidDataException
-                                       or LocalBlobCipher.WrongPasscodeException)
-        {
-            Append(LogLevel.Error, ex.Message);
-            Status = "Could not read the folder.";
-        }
-        finally
-        {
-            IsRunning = false;
-        }
-    }
-
-    private async Task StartAsync()
-    {
-        _cancellation = new CancellationTokenSource();
-        Log.Clear();
-        Databases.Clear();
-        Summary = string.Empty;
-        _currentBytes = 0;
-        Raise(nameof(BytesWritten));
-        Progress = 0;
-        IsRunning = true;
-
-        try
-        {
-            Status = "Deriving the local key ...";
-
-            var options = BuildOptions();
-            var report = await Task
-                .Run(() =>
-                {
-                    _localKey ??= LoadLocalKey();
-                    return new ExtractionEngine(options).Run(TdataPath, _localKey);
-                }, _cancellation.Token)
-                .ConfigureAwait(true);
-
-            _report = report;
-            Append(LogLevel.Success, $"Finished in {report.Duration.TotalSeconds:0.0}s.");
-            WriteReports(report);
-            PublishSummary(report);
+                session = new RecoverySession(source, passcode);
+                return session.Scan(CreateProgress(), operation.Token);
+            });
+            operation.Token.ThrowIfCancellationRequested();
+            _session = session;
+            session = null;
+            SetItems(catalog.Items.Select(i => new MediaItemViewModel(i)));
+            HasCatalog = true;
+            CatalogSummary = $"Found {_items.Count:N0} media · Avatars/icons {_items.Count(i => i.Item.Usage == CacheUsage.ProfilePhoto):N0} · Thumbnails/covers {_items.Count(i => i.Item.Usage is CacheUsage.DocumentThumbnail or CacheUsage.StickerSetThumbnail or CacheUsage.AudioAlbumCover):N0} · {catalog.UnreadableValues} unreadable · {catalog.UnknownValues} unrecognized";
+            foreach (var warning in catalog.Warnings) { Append(warning); }
+            Status = catalog.Warnings.Count == 0 ? "Scan complete. Browse media, check items and export your selection." : $"Scan complete with {catalog.Warnings.Count} index warnings. See the activity log.";
             Progress = 100;
-            Status = $"{report.Counters.FilesWritten:N0} files recovered.";
+            Append(CatalogSummary);
         }
-        catch (OperationCanceledException)
-        {
-            Append(LogLevel.Warning, "Cancelled by the user.");
-            Status = "Cancelled.";
-        }
-        catch (Exception ex) when (ex is IOException or InvalidDataException
-                                       or LocalBlobCipher.WrongPasscodeException or UnauthorizedAccessException)
-        {
-            Append(LogLevel.Error, ex.Message);
-            Status = "Extraction failed.";
-        }
-        finally
-        {
-            _cancellation.Dispose();
-            _cancellation = null;
-            IsRunning = false;
-            Raise(nameof(StartCommand));
-            Raise(nameof(CancelCommand));
-            Raise(nameof(OpenReportCommand));
-        }
+        catch (OperationCanceledException) { Status = "Scan cancelled."; }
+        catch (Exception ex) when (IsExpected(ex)) { Status = "Scan failed. Check the data directory and local passcode."; Append(ex.Message); }
+        finally { session?.Dispose(); EndOperation(); }
     }
 
-    private LocalKey LoadLocalKey()
+    public async Task ExportSelectedAsync(string destination)
     {
-        var notes = new List<string>();
-        var key = LocalKeyLoader.Load(TdataPath, Passcode, notes.Add);
-        foreach (var note in notes)
+        if (IsBusy || _session is null || _selected.Count == 0) { return; }
+        var session = _session;
+        var selection = _selected.Select(i => i.Item).ToArray();
+        using var operation = BeginOperation($"Exporting {selection.Length:N0} items...");
+        try
         {
-            Append(LogLevel.Detail, note);
+            var result = await Task.Run(() => session.Export(selection, destination, CreateProgress(), operation.Token));
+            LastOutput = result.Report.OutputDirectory;
+            Status = $"{(result.Cancelled ? "Export cancelled" : "Export complete")}: saved {result.Report.Items.Count:N0} items, {result.Failures.Count} failed.";
+            foreach (var failure in result.Failures) { Append(failure); }
+            Append(Status + " " + LastOutput);
+            Progress = result.Cancelled ? Progress : 100;
         }
-
-        Append(LogLevel.Success, $"Local key loaded ({key.Length} bytes).");
-        return key;
+        catch (OperationCanceledException) { Status = "Export cancelled."; }
+        catch (Exception ex) when (IsExpected(ex)) { Status = "Export failed. See the activity log."; Append(ex.Message); }
+        finally { EndOperation(); }
     }
 
-    private ExtractionOptions BuildOptions() => new()
-    {
-        OutputDirectory = OutputPath,
-        Accounts = [.. SplitList(Accounts)],
-        Databases = [.. new[] { IncludeCache ? "cache" : null, IncludeMediaCache ? "media_cache" : null }
-            .Where(static n => n is not null).Select(static n => n!)],
-        MinimumSize = ParseSize(MinimumSize),
-        MaximumSize = ParseSize(MaximumSize),
-        KeepUnknownContent = KeepUnknown,
-        MinimumCoverage = MinimumCoverage,
-        RequireStreamHeader = RequireStreamHeader,
-        ScanOrphans = ScanOrphans,
-        ComputeHashes = ComputeHashes,
-        DatedFileNames = DatedNames,
-        MarkPartialFiles = MarkPartials,
-        WriteManifest = true,
-        WriteJsonManifest = WriteJsonManifest,
-        WriteHtmlReport = WriteHtmlReport,
-        MaxDegreeOfParallelism = Threads,
-        CancellationToken = _cancellation?.Token ?? CancellationToken.None,
-        Log = message => Append(Verbose ? LogLevel.Detail : LogLevel.Info, message),
-        Progress = new Progress<ExtractionProgress>(OnProgress),
-    };
+    public Task EnsureThumbnailAsync(MediaItemViewModel item) => _closing || _session is null ? Task.CompletedTask
+        : _thumbnails.EnsureAsync(item, _session, _scanLifetime.Token);
+    public void ReleaseThumbnail(MediaItemViewModel item) => _thumbnails.Release(item);
+    private bool Matches(object value) => value is MediaItemViewModel item && _filter.Matches(item);
 
-    private void OnProgress(ExtractionProgress progress)
+    private void RefreshFilters()
     {
-        Progress = progress.DatabasesTotal == 0
-            ? 0
-            : 100.0 * progress.DatabasesDone / progress.DatabasesTotal;
-        _currentBytes = progress.BytesWritten;
-        Raise(nameof(BytesWritten));
-        Status = $"{progress.CurrentDatabase}: {progress.FilesWritten:N0} files, {Format(progress.BytesWritten)}.";
-    }
-
-    private void WriteReports(ExtractionReport report)
-    {
-        Directory.CreateDirectory(OutputPath);
-        CsvManifestWriter.WriteCsv(Path.Combine(OutputPath, "manifest.csv"), report);
-        CsvManifestWriter.WriteSkippedCsv(Path.Combine(OutputPath, "skipped.csv"), report);
-
-        if (WriteJsonManifest)
+        _filter.Update(KindFilter, UsageFilter, StateFilter, Query, MinimumSize, MaximumSize, DateFrom, DateTo);
+        FilterError = _filter.Error;
+        if (_appliedSort != Sort)
         {
-            JsonManifestWriter.WriteJson(Path.Combine(OutputPath, "manifest.json"), report);
-        }
-
-        if (WriteHtmlReport)
-        {
-            HtmlReportWriter.Write(Path.Combine(OutputPath, "index.html"), report);
-        }
-    }
-
-    private void PublishSummary(ExtractionReport report)
-    {
-        var filesByDatabase = report.Items
-            .GroupBy(static i => (i.Account, i.Database))
-            .ToDictionary(
-                static g => $"{g.Key.Account}/{g.Key.Database}",
-                static g => (Files: (long)g.Count(), Bytes: g.Sum(static i => i.Size)));
-
-        Databases.Clear();
-        foreach (var database in report.Databases)
-        {
-            var label = $"{database.Account}/{database.Database}";
-            filesByDatabase.TryGetValue(label, out var stats);
-
-            Databases.Add(new DatabaseSummary(
-                label,
-                database.Version,
-                database.LiveEntries,
-                stats.Files,
-                stats.Bytes,
-                string.Join("; ", database.Warnings)));
-        }
-
-        Summary = string.Join(
-            Environment.NewLine,
-            $"Recovered {report.Counters.FilesWritten:N0} files ({Format(report.Counters.BytesWritten)}) "
-                + $"from {report.Counters.EntriesSeen:N0} cache entries in "
-                + $"{report.Duration.TotalSeconds:0.0}s.",
-            $"Duplicates skipped : {report.Counters.Duplicates:N0}",
-            $"Not recognised     : {Skipped(report, SkipReason.NotRecognisedMedia):N0}",
-            $"Mostly missing     : {Skipped(report, SkipReason.MostlyMissing):N0}",
-            $"Orphan candidates  : {report.Counters.OrphanCandidates:N0}",
-            string.Empty,
-            string.Join(Environment.NewLine,
-                report.ByCategory
-                    .OrderByDescending(static p => p.Value)
-                    .Select(c => $"  {c.Key,-12} {c.Value,7:N0} files  {Format(report.BytesByCategory[c.Key]),12}")));
-    }
-
-    private static long Skipped(ExtractionReport report, SkipReason reason) =>
-        report.Counters.Skipped.TryGetValue(reason, out var value) ? value : 0;
-
-    private List<LogEntry> DescribeFolder()
-    {
-        var entries = new List<LogEntry>();
-        var key = LoadLocalKey();
-
-        foreach (var database in CacheDatabaseLocator.Discover(TdataPath))
-        {
-            entries.Add(new LogEntry(
-                DateTimeOffset.Now, LogLevel.Info, $"{database}:"));
-
-            foreach (var version in database.Versions())
+            using (_itemsView.DeferRefresh())
             {
-                try
-                {
-                    var parsed = CacheBinlogReader.ReadFile(version.BinlogPath, key, version.Number);
-                    entries.Add(new LogEntry(
-                        DateTimeOffset.Now,
-                        LogLevel.Info,
-                        $"   version {version.Number}: {parsed.Entries.Count:N0} live entries, "
-                            + $"{parsed.RecordsRead:N0} records"
-                            + (parsed.Header.TrackEstimatedTime ? ", timestamps present" : string.Empty)
-                            + (parsed.Truncated ? $" (stopped at byte {parsed.StoppedAtOffset:N0})" : string.Empty)));
-                }
-                catch (Exception ex) when (ex is IOException or InvalidDataException)
-                {
-                    entries.Add(new LogEntry(
-                        DateTimeOffset.Now, LogLevel.Warning, $"   version {version.Number}: {ex.Message}"));
-                }
+                _itemsView.SortDescriptions.Clear();
+                var property = Sort.StartsWith("Size", StringComparison.Ordinal) ? nameof(MediaItemViewModel.Bytes)
+                    : Sort == "File type" ? nameof(MediaItemViewModel.Extension) : nameof(MediaItemViewModel.Date);
+                var direction = Sort is "Cache date: oldest first" or "Size: smallest first" or "File type" ? ListSortDirection.Ascending : ListSortDirection.Descending;
+                _itemsView.SortDescriptions.Add(new SortDescription(property, direction));
+                _appliedSort = Sort;
             }
         }
-
-        return entries;
+        else { _itemsView.Refresh(); }
+        VisibleCount = _itemsView is CollectionView view ? view.Count : _itemsView.Cast<object>().Count();
+        Raise(nameof(SelectionSummary));
+        SelectVisibleCommand.RaiseCanExecuteChanged();
     }
-
-    private void BrowseForFolder(string current, Action<string> assign)
+    private void SetItems(IEnumerable<MediaItemViewModel> items)
     {
-        var dialog = new Microsoft.Win32.OpenFolderDialog
-        {
-            Title = "Choose a folder",
-            InitialDirectory = Directory.Exists(current) ? current : null,
-        };
-
-        if (dialog.ShowDialog() == true)
-        {
-            assign(dialog.FolderName);
-        }
+        foreach (var item in _items) { item.PropertyChanged -= ItemChanged; }
+        _items = new ObservableCollection<MediaItemViewModel>(items);
+        foreach (var item in _items) { item.PropertyChanged += ItemChanged; }
+        _itemsView = CollectionViewSource.GetDefaultView(_items);
+        _appliedSort = null;
+        _itemsView.Filter = Matches;
+        Raise(nameof(ItemsView));
+        Raise(nameof(Items));
+        RefreshFilters();
     }
 
-    private void Append(LogLevel level, string message)
+    private void ItemChanged(object? sender, PropertyChangedEventArgs e)
     {
-        var entry = new LogEntry(DateTimeOffset.Now, level, message);
-        if (_dispatcher.CheckAccess())
-        {
-            AddEntry(entry);
-        }
-        else
-        {
-            _dispatcher.BeginInvoke(() => AddEntry(entry));
-        }
+        if (e.PropertyName != nameof(MediaItemViewModel.IsChecked) || sender is not MediaItemViewModel item) { return; }
+        if (item.IsChecked && _selected.Add(item)) { _selectedBytes += item.Bytes; }
+        else if (!item.IsChecked && _selected.Remove(item)) { _selectedBytes -= item.Bytes; }
+        if (!_batchSelection) { SelectionChanged(); }
     }
-
-    private void AddEntry(LogEntry entry)
+    private void CheckVisible()
     {
-        Log.Add(entry);
-        while (Log.Count > 5000)
-        {
-            Log.RemoveAt(0);
-        }
+        _batchSelection = true;
+        foreach (var item in _itemsView.Cast<MediaItemViewModel>()) { item.IsChecked = true; }
+        _batchSelection = false;
+        SelectionChanged();
     }
-
-    private static IEnumerable<string> SplitList(string value) =>
-        value.Split([',', ';'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-
-    private static long ParseSize(string text) =>
-        ByteSize.TryParse(text, out var bytes) ? bytes : 0;
-
-    internal static string Format(long bytes) => ByteSize.Format(bytes);
-
-    private static string DefaultTdata()
+    private void ClearSelection()
     {
-        var probe = new DirectoryInfo(AppContext.BaseDirectory);
-        for (var level = 0; level < 4 && probe is not null; level++, probe = probe.Parent)
+        _batchSelection = true;
+        foreach (var item in _selected.ToArray()) { item.IsChecked = false; }
+        _batchSelection = false;
+        SelectionChanged();
+    }
+    private void SelectionChanged()
+    {
+        Raise(nameof(SelectedCount));
+        Raise(nameof(SelectionSummary));
+        RefreshCommands();
+    }
+    private void ResetFilters()
+    {
+        _query = _minimumSize = _maximumSize = string.Empty;
+        _kindFilter = "All types";
+        _usageFilter = "All usage";
+        _stateFilter = "All states";
+        _dateFrom = _dateTo = null;
+        foreach (var property in new[] { nameof(Query), nameof(MinimumSize), nameof(MaximumSize), nameof(KindFilter), nameof(UsageFilter), nameof(StateFilter), nameof(DateFrom), nameof(DateTo) }) { Raise(property); }
+        RefreshFilters();
+    }
+    private CancellationTokenSource BeginOperation(string status)
+    {
+        _operation = new CancellationTokenSource();
+        Status = status;
+        Progress = 0;
+        IsBusy = true;
+        return _operation;
+    }
+    private void EndOperation() { _operation = null; IsBusy = false; }
+    private IProgress<RecoveryProgress> CreateProgress()
+    {
+        var operation = _operation;
+        return new Progress<RecoveryProgress>(progress => _dispatcher.BeginInvoke(() =>
         {
-            var candidate = Path.Combine(probe.FullName, "tdata");
-            if (File.Exists(Path.Combine(candidate, "key_datas")))
-            {
-                return candidate;
-            }
-        }
-
-        return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "tdata");
+            if (!IsBusy || !ReferenceEquals(operation, _operation)) { return; }
+            var percent = progress.Total == 0 ? 0 : 100.0 * progress.Completed / progress.Total;
+            if (percent < Progress) { return; }
+            Progress = percent;
+            Status = progress.Phase == "export" ? $"Exporting {progress.Completed:N0} / {progress.Total:N0} items..."
+                : $"Scanning {progress.Phase} · {progress.Completed:N0}/{progress.Total:N0} · {progress.Files:N0} media found";
+        }));
+    }
+    private void RefreshCommands()
+    {
+        ScanCommand.RaiseCanExecuteChanged(); ExportCommand.RaiseCanExecuteChanged(); CancelCommand.RaiseCanExecuteChanged();
+        FindSourcesCommand.RaiseCanExecuteChanged(); SelectVisibleCommand.RaiseCanExecuteChanged(); ClearSelectionCommand.RaiseCanExecuteChanged();
+    }
+    private void Append(string message)
+    {
+        Log.Add($"{DateTime.Now:HH:mm:ss}  {message}");
+        while (Log.Count > 200) { Log.RemoveAt(0); }
+    }
+    private static bool IsExpected(Exception ex) => ex is IOException or InvalidDataException or UnauthorizedAccessException
+        or ArgumentException or NotSupportedException or DllNotFoundException or TypeInitializationException
+        or System.Security.Cryptography.CryptographicException or TelegramMediaRecovery.Core.Crypto.LocalBlobCipher.WrongPasscodeException;
+    private void ClearPreview() => _previews.Clear();
+    private void ResetCatalog()
+    {
+        ClearPreview();
+        _scanLifetime.Cancel(); _scanLifetime.Dispose(); _scanLifetime = new CancellationTokenSource();
+        _session?.Dispose(); _session = null;
+        _selected.Clear(); _selectedBytes = 0;
+        _thumbnails.Reset();
+        _current = null; Raise(nameof(CurrentItem)); Raise(nameof(HasCurrentItem)); Raise(nameof(CurrentDetails));
+        HasCatalog = false;
+        CatalogSummary = "Scanning reads the cache. Choose files to export after browsing.";
+        Progress = 0;
+        SetItems([]);
+        SelectionChanged();
+    }
+    public void Dispose()
+    {
+        if (_disposed) { return; }
+        _disposed = true; _closing = true;
+        _operation?.Cancel();
+        ClearPreview(); _thumbnails.Reset(); _scanLifetime.Cancel(); _session?.Dispose();
     }
 
-    private static string DefaultOutput() =>
-        Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
-            "TelegramMediaRecovery");
+    public async Task CancelAndWaitAsync()
+    {
+        _closing = true;
+        _operation?.Cancel();
+        try { await Task.WhenAll(ScanCommand.Execution, ExportCommand.Execution, _previews.StopAsync(), _thumbnails.StopAsync()); }
+        finally { if (!_disposed) { _closing = false; } }
+    }
 }

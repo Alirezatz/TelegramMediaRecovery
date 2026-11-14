@@ -19,7 +19,10 @@ public sealed class RelayCommand(Action<object?> execute, Func<object?, bool>? c
     public bool CanExecute(object? parameter) => _canExecute?.Invoke(parameter) ?? true;
 
     /// <inheritdoc />
-    public void Execute(object? parameter) => _execute(parameter);
+    public void Execute(object? parameter)
+    {
+        if (CanExecute(parameter)) { _execute(parameter); }
+    }
 
     /// <summary>Tells the UI to re-query <see cref="CanExecute"/>.</summary>
     public void RaiseCanExecuteChanged() =>
