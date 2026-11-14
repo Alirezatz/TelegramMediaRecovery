@@ -140,7 +140,7 @@ public sealed class CryptoTests
         // the decrypted prefix is what has to match.
         var blob = LocalBlobCipher.Encrypt(payload, localKey.Span);
         var decrypted = LocalBlobCipher.Decrypt(blob, localKey.Span);
-        Assert.Equal(payload, decrypted[..payload.Length]);
+        Assert.Equal(payload, decrypted);
 
         var wrongKey = new LocalKey(RandomNumber(256));
         Assert.Throws<LocalBlobCipher.WrongPasscodeException>(
