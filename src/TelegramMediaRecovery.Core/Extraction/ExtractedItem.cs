@@ -37,6 +37,8 @@ public sealed class ExtractedItem
 
     /// <summary>Detected container.</summary>
     public required MediaFormat Format { get; init; }
+    /// <summary>Role inferred from recognized Telegram cache namespaces; unknown for orphan values.</summary>
+    public CacheUsage CacheUsage { get; init; }
 
     /// <summary>Absolute path of the written file, or <c>null</c> when nothing was written.</summary>
     public string? OutputPath { get; init; }

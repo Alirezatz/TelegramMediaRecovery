@@ -1,3 +1,5 @@
+using System.Buffers;
+using System.Numerics;
 using System.Security.Cryptography;
 
 namespace TelegramMediaRecovery.Core.Crypto;
@@ -30,7 +32,6 @@ public sealed class AesCtrCipher : IDisposable
     private readonly byte[] _initialIv = new byte[BlockSize];
     private readonly byte[] _counter = new byte[BlockSize];
     private readonly byte[] _keystream = new byte[BlockSize];
-    private int _available;
     private bool _disposed;
 
     /// <summary>Creates a CTR cipher whose counter starts at <paramref name="iv"/>.</summary>
@@ -52,14 +53,13 @@ public sealed class AesCtrCipher : IDisposable
         _block = _aes.CreateEncryptor();
         iv.CopyTo(_initialIv);
         _initialIv.CopyTo(_counter, 0);
-        _available = 0;
     }
 
     /// <summary>
     /// Applies the keystream to <paramref name="buffer"/> in place, starting at
     /// block <paramref name="firstBlockIndex"/>.
     /// </summary>
-    public void Transform(Span<byte> buffer, long firstBlockIndex = 0)
+    public void Transform(Span<byte> buffer, long firstBlockIndex = 0, CancellationToken cancellationToken = default)
     {
         if (buffer.IsEmpty)
         {
@@ -67,28 +67,51 @@ public sealed class AesCtrCipher : IDisposable
         }
 
         SetCounter(firstBlockIndex);
-        _available = 0;
-
-        var offset = 0;
-        while (offset < buffer.Length)
+        if (buffer.Length < 256)
         {
-            if (_available == 0)
+            for (var offset = 0; offset < buffer.Length; offset += BlockSize)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 _block.TransformBlock(_counter, 0, BlockSize, _keystream, 0);
                 IncrementCounter(_counter);
-                _available = BlockSize;
+                Xor(buffer.Slice(offset, Math.Min(BlockSize, buffer.Length - offset)), _keystream);
             }
-
-            var chunk = Math.Min(_available, buffer.Length - offset);
-            var window = buffer.Slice(offset, chunk);
-            var stream = _keystream.AsSpan(0, chunk);
-            for (var i = 0; i < chunk; i++)
-            {
-                window[i] ^= stream[i];
-            }
-            offset += chunk;
-            _available -= chunk;
+            return;
         }
+        const int BatchSize = 64 * 1024;
+        var counters = ArrayPool<byte>.Shared.Rent(BatchSize);
+        var keystream = ArrayPool<byte>.Shared.Rent(BatchSize);
+        try
+        {
+            for (var offset = 0; offset < buffer.Length; offset += BatchSize)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var chunk = Math.Min(BatchSize, buffer.Length - offset);
+                var padded = (chunk + BlockSize - 1) & ~(BlockSize - 1);
+                for (var index = 0; index < padded; index += BlockSize)
+                {
+                    _counter.CopyTo(counters, index);
+                    IncrementCounter(_counter);
+                }
+                _block.TransformBlock(counters, 0, padded, keystream, 0);
+                Xor(buffer.Slice(offset, chunk), keystream);
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(counters, clearArray: true);
+            ArrayPool<byte>.Shared.Return(keystream, clearArray: true);
+        }
+    }
+
+    private static void Xor(Span<byte> destination, ReadOnlySpan<byte> keystream)
+    {
+        var index = 0;
+        for (; index <= destination.Length - Vector<byte>.Count; index += Vector<byte>.Count)
+        {
+            (new Vector<byte>(destination[index..]) ^ new Vector<byte>(keystream[index..])).CopyTo(destination[index..]);
+        }
+        for (; index < destination.Length; index++) { destination[index] ^= keystream[index]; }
     }
 
     /// <summary>

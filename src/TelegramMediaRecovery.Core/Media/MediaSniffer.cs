@@ -6,10 +6,10 @@ namespace TelegramMediaRecovery.Core.Media;
 /// Identifies a cached value from its first bytes.
 /// </summary>
 /// <remarks>
-/// Everything in the cache is stored as raw bytes with no metadata whatsoever: the
-/// binlog only knows a key, a size and an XXH32 checksum. The only way to learn
-/// what a file is (and therefore what to call it on disk) is to look at its magic
-/// bytes, so this class carries a deliberately wide table &mdash; Telegram caches
+/// The binlog retains a key, category tag, size and XXH32 checksum, but no original
+/// filename or MIME type. Container detection therefore reads magic bytes;
+/// cache-role classification is a separate concern. This class carries a wide
+/// table &mdash; Telegram caches
 /// whatever a user receives, not only photos and videos.
 /// <para>
 /// Magic numbers are written as byte lists rather than as <c>"..."u8</c> string

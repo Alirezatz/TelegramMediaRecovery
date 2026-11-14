@@ -172,15 +172,28 @@ public sealed class TdefFile : IDisposable
             return [];
         }
 
-        var available = PayloadSize - offset;
-        var wanted = (int)Math.Min((long)((length + 15) & ~15L), available);
-
-        var buffer = new byte[wanted];
-        _stream.Seek(PayloadOffset + offset, SeekOrigin.Begin);
+        var wanted = (int)Math.Min(length, PayloadSize - offset);
+        var prefix = (int)(offset % 16);
+        var buffer = new byte[prefix + wanted];
+        _stream.Seek(PayloadOffset + offset - prefix, SeekOrigin.Begin);
         ReadExactly(buffer);
         DecryptWithCtr(_ctrKey, _baseIv, HeaderBlocks + (offset / 16), buffer);
 
-        return wanted == length ? buffer : buffer[..length];
+        return prefix == 0 ? buffer : buffer[prefix..];
+    }
+
+    /// <summary>Reads a logical value into reusable memory. The offset must be block aligned; the length need not be.</summary>
+    public void Read(long offset, Span<byte> destination, CancellationToken cancellationToken = default)
+    {
+        if (offset < 0 || offset % 16 != 0 || offset + destination.Length > PayloadSize)
+        {
+            throw new ArgumentOutOfRangeException(nameof(offset));
+        }
+        cancellationToken.ThrowIfCancellationRequested();
+        _stream.Seek(PayloadOffset + offset, SeekOrigin.Begin);
+        _stream.ReadExactly(destination);
+        using var cipher = new AesCtrCipher(_ctrKey, _baseIv);
+        cipher.Transform(destination, HeaderBlocks + offset / 16, cancellationToken);
     }
 
     /// <summary>

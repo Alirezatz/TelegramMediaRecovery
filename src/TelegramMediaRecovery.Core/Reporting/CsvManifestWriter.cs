@@ -11,8 +11,8 @@ namespace TelegramMediaRecovery.Core.Reporting;
 /// <remarks>
 /// Columns:
 /// <c>account, database, source, key_high, key_low, place, version, stored_size,
-/// size, coverage, kind, extension, sha256, fragments, partial, date,
-/// output, first_bytes</c>.
+/// size, coverage, kind, extension, mime, sha256, fragments, partial, date,
+/// output, cache_usage</c>.
 /// </remarks>
 public static class CsvManifestWriter
 {
@@ -36,7 +36,8 @@ public static class CsvManifestWriter
         "fragments",
         "partial",
         "date",
-        "output");
+        "output",
+        "cache_usage");
 
     /// <summary>Formats one item as a CSV row.</summary>
     public static string ToCsvRow(ExtractedItem item)
@@ -46,7 +47,8 @@ public static class CsvManifestWriter
             Quote(item.Account),
             Quote(item.Database),
             Quote(item.Source),
-            Quote(item.Key.ToString()),
+            item.Key.High.ToString("x16", CultureInfo.InvariantCulture),
+            item.Key.Low.ToString("x16", CultureInfo.InvariantCulture),
             Quote(item.Place),
             item.Version.ToString(CultureInfo.InvariantCulture),
             item.StoredSize.ToString(CultureInfo.InvariantCulture),
@@ -59,7 +61,8 @@ public static class CsvManifestWriter
             item.FragmentCount.ToString(CultureInfo.InvariantCulture),
             item.IsPartial ? "1" : "0",
             Quote(item.Date.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)),
-            Quote(item.RelativePath));
+            Quote(item.RelativePath),
+            Quote(item.CacheUsage.ToString()));
     }
 
     /// <summary>Writes the manifest.</summary>

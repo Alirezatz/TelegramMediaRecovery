@@ -89,12 +89,13 @@ public sealed class StreamingTests
     }
 
     [Fact]
-    public void SlicesArePlacedAtTheirFileOffsets()
+    public void OverlappingHeaderAndBodyKeepTheLongestAvailableParts()
     {
         // The base value is neither recognisable media nor a valid part map, so it
         // is treated as raw bytes at offset 0; slice 1 lands at kInSlice.
         var baseValue = BuildJpeg(64);
         var slice = new byte[StreamingLayout.InSlice];
+        baseValue.CopyTo(slice, 0);
 
         var entries = new[] { Entry(0x42, 0, baseValue), Entry(0x42, 1, slice) };
         var plan = StreamedFilePlanner.BuildPlan(
@@ -103,7 +104,9 @@ public sealed class StreamingTests
 
         Assert.Equal(StreamingLayout.InSlice, plan.FileSize);
         Assert.Equal(2, plan.Fragments.Count);
-        Assert.Contains(plan.AllParts(), p => p.Offset == 0 && p.Length == 64);
+        Assert.Contains(plan.AllParts(), p => p.Offset == 0 && p.Length == StreamingLayout.PartSize);
+        Assert.Equal(baseValue, plan.AllParts()[0].Data.Span[..baseValue.Length].ToArray());
+        Assert.Equal(StreamingLayout.InSlice, plan.CachedBytes);
         Assert.Contains(plan.AllParts(), p => p.Offset + p.Length == StreamingLayout.InSlice);
     }
 
