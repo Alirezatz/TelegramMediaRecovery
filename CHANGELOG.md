@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-15
+
 ### Added
 
 - Cache-usage filters for media bodies, profile pictures/icons, thumbnails/covers, stickers and unknown roles.
