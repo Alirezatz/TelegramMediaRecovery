@@ -52,11 +52,11 @@ value cryptographically, and writes the media out.
 
 ## Screenshots
 
-> Add your own screenshots under `docs/images/` when you open a pull request.
+The desktop browser uses synthetic media in the screenshot below. No real account data is included.
 
-| Main window | HTML report |
-|---|---|
-| Settings on the left, activity log on the right, cancellable at any point | `index.html` — a self-contained offline gallery |
+![Desktop media browser](docs/images/desktop-browser.png)
+
+The optional `index.html` report remains available after export as a self-contained offline gallery.
 
 ---
 
@@ -73,13 +73,34 @@ cd TelegramMediaRecovery
 dotnet run --project src/TelegramMediaRecovery.Desktop
 ```
 
-1. Pick your `tdata` folder (the one containing `key_datas`).
-2. Enter the local passcode if you set one — otherwise leave it empty.
-3. Choose an output folder.
-4. Press **Start recovery**.
+1. Choose a `tdata` folder, a cache snapshot, or the Telegram Desktop directory. **Find local data** discovers common installs.
+2. Enter the local passcode if one is set, and click **Scan media**. Scanning builds a metadata catalog without exporting files.
+3. Browse thumbnails; filter by media type, known size, estimated cache date, or status. Select an item to preview it.
+4. Check the files you want, click **Export checked**, and choose a destination. Each export creates a new directory.
 
-**Inspect folder** prints what each database contains (live entry counts, record counts, whether timestamps
-are present) without writing anything, which is the fastest way to check that the folder is readable.
+JPEG, PNG, WebP and other images are decoded locally; `.tgs` stickers have an animated Lottie preview.
+Audio/video playback uses the Windows media decoder. If a format is unsupported, use the external-player button or export it.
+Only visible image thumbnails are loaded, with a bounded cache; selecting a video creates a disposable temporary preview file.
+Rapid scrolling prioritizes the latest visible thumbnails and cancels offscreen requests. Animated sticker
+preview uses a reusable pixel surface, and closing the app drains pending preview and recovery work.
+Resize the filter and preview panes by dragging their dividers. **Ctrl+F** focuses search; **Escape**
+cancels an active scan or export. Scan progress covers all cache databases in the selected data source.
+
+The browser labels streamed-file completeness as unconfirmed unless gaps are already known. A decodable preview
+does not establish that the entire original survived. Dates are cache estimates, and saving restrictions remain
+unknown because the tool does not associate cache files with source messages.
+If Telegram evicts slices after scanning, export recalculates the available coverage and marks the output
+partial, including when a previously known trailing slice disappears.
+Export failures are also listed in `skipped.csv` alongside the manifests and HTML report.
+
+The initial browser lists indexed, checksum-verified media. The CLI retains its existing orphan-scan options.
+
+**Cache usage** separates main photo/document media, profile/group/channel pictures, thumbnails/covers,
+stickers/emoji and unknown roles. **Hide avatars and thumbnails** hides the recognized auxiliary roles while keeping
+unknown files visible. These labels use Telegram's encoded cache keys and sticker tags, not a guess
+based on small file size or square dimensions. A logo sent as a normal photo remains photo media;
+photo caches may also contain multiple size variants. The preview explains the classification, and
+CSV/JSON exports retain it in `cache_usage` / `CacheUsage`.
 
 ### Command line
 
@@ -113,7 +134,7 @@ tmr --tdata <path> [options]
   --dated-names         prefix file names with the estimated date
   --live-version-only   ignore older cache version folders
   --limit <n>           stop after n files per database
-  --threads <n>         worker threads (default: one per CPU)
+  --threads <n>         worker threads (default: CPU count, capped at 4)
   --json                also write manifest.json
   --html                also write index.html
   --list                print an inventory and exit
@@ -161,7 +182,7 @@ unreferenced-file scan. `key_high`/`key_low`/`place` are enough to find the exac
 | **Layouts** | Modern multi-account (`key_datas`) and the legacy pre-multi-account (`<hash>/maps`) key file |
 | **Local key sizes** | 256-byte and 64-byte (`EncryptionKey::kSize` and `kSize_v2`) |
 | **Databases** | `cache` and `media_cache` for every `user_data#N` account |
-| **Binlog records** | `Store`, `StoreWithTime`, `MultiStore`, `MultiRemove`, `MultiAccess` |
+| **Binlog records** | `Store`, `StoreWithTime`, `MultiStore`, `MultiRemove`, `MultiAccess`; automatic detection of official 3-byte and wide 24-byte `EntrySize` layouts |
 | **Cache versions** | the live `version` folder plus any older folders that still hold a binlog |
 | **Streamed media** | contiguous slices, complex part maps, and "good headers" with the first slice folded in |
 | **Formats** | JPEG, PNG, GIF, WebP, BMP, TIFF, ICO, AVIF, HEIC, SVG, MP4/MOV/3GP/M4V, Matroska, WebM, MPEG, MP3, AAC, OGG, Opus, FLAC, WAV, Lottie `.tgs`, gzip, PDF, ZIP, 7z, RAR, TTF/OTF/WOFF/WOFF2 |
@@ -217,13 +238,15 @@ src/
     Crypto/                                        key derivation, IGE, CTR, XXH32
     Containers/                                     TDF$ and TDEF containers
     Cache/                                          binlog framing and database discovery
+    Browsing/                                       scan catalog, previews and selected export
     Media/                                          sniffing, part maps, stream reassembly
     Extraction/                                     the engine and its options
     Reporting/                                      CSV / JSON manifests and the HTML gallery
   TelegramMediaRecovery.Desktop/     net10.0-windows — WPF app (MVVM, no MVVM framework)
   TelegramMediaRecovery.Cli/         net10.0     — headless front end
 tests/
-  TelegramMediaRecovery.Core.Tests/  net10.0     — 73 tests over the byte layouts and the crypto
+  TelegramMediaRecovery.Core.Tests/  net10.0     — byte layouts, crypto and recovery sessions
+  TelegramMediaRecovery.Desktop.Tests/ net10.0-windows — browser workflow, previews and WPF bindings
 ```
 
 `Core` has no dependency on the WPF project, which is what makes the format reader testable and reusable.
@@ -234,7 +257,7 @@ tests/
 
 ```powershell
 dotnet build                 # whole solution
-dotnet test                  # unit + end-to-end tests
+dotnet test                  # core + WPF tests (Windows)
 dotnet format --verify-no-changes
 ```
 
@@ -243,11 +266,15 @@ The tests cover the parts that are easy to get silently wrong:
 - XXH32 against the reference vectors
 - AES-256-CTR against the NIST SP 800-38A counter-mode vector
 - the local blob (IGE + msgkey) round trip and its wrong-passcode failure
-- the binlog record layout: the 24-byte `EntrySize`, the 64/80-byte record sizes, every record type, the
+- both binlog layouts: 3/24-byte `EntrySize`, 32/48- and 64/80-byte record sizes, every record type, the
   `MultiRemove`/`MultiAccess` semantics, and where the reader must stop
 - place-id rendering, including the low-nibble-first twist
 - complex part maps and the "good header" merge
 - an end-to-end run over a synthetic `tdata` folder the test builds itself
+- scan without output, selected-only export, cancellation, source protection and temporary preview cleanup
+- JPEG/WebP/TGS previews, filtering, checkbox selection, commands and rendered WPF bindings
+
+Run the Core test project directly on Linux or macOS; the Desktop project and its tests require Windows.
 
 ---
 
