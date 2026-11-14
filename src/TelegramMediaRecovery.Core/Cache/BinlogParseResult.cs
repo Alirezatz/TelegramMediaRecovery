@@ -16,7 +16,8 @@ public sealed class BinlogParseResult
         int multiRemoveRecords,
         int multiAccessRecords,
         int rejectedRecords,
-        int stoppedAtOffset)
+        int stoppedAtOffset,
+        CacheRecordFormat recordFormat = CacheRecordFormat.WideEntrySize)
     {
         Header = header;
         Entries = entries;
@@ -28,10 +29,14 @@ public sealed class BinlogParseResult
         MultiAccessRecords = multiAccessRecords;
         RejectedRecords = rejectedRecords;
         StoppedAtOffset = stoppedAtOffset;
+        RecordFormat = recordFormat;
     }
 
     /// <summary>The header that was read at offset 0.</summary>
     public CacheBasicHeader Header { get; }
+
+    /// <summary>The selected native Store record layout.</summary>
+    public CacheRecordFormat RecordFormat { get; }
 
     /// <summary>Keys that survive to the end of the binlog.</summary>
     public Dictionary<CacheKey, CacheEntry> Entries { get; }

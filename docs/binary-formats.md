@@ -7,8 +7,9 @@ include the padding a 64-bit MSVC/Itanium build inserts.
 
 Reference repositories:
 
-- `Telegram/SourceFiles/...` — [TDesktop-x64/tdesktop](https://github.com/TDesktop-x64/tdesktop) (64Gram), branch `dev`
-- `Telegram/lib_storage` — [TDesktop-x64/lib_storage](https://github.com/TDesktop-x64/lib_storage), branch `master`
+- `Telegram/SourceFiles/...` — [telegramdesktop/tdesktop](https://github.com/telegramdesktop/tdesktop), branch `dev`
+- Official cache layout — [desktop-app/lib_storage](https://github.com/desktop-app/lib_storage), branch `master`
+- Wide-entry variant — [TDesktop-x64/lib_storage](https://github.com/TDesktop-x64/lib_storage), branch `master`
 
 ---
 
@@ -113,7 +114,7 @@ encrypt: out[i] = E( in[i] ^ iv0 ) ^ iv1 ;  iv0 = out[i] ; iv1 = in[i]
 After decryption the plaintext is:
 
 ```
-[0:4]   uint32 LE   total length, including the trailing padding
+[0:4]   uint32 LE   logical length n, including this length field and excluding padding
 [4:n]   payload
 [n:]    random padding out to a multiple of 16
 ```
@@ -210,6 +211,22 @@ short and the framing collapses immediately.
 
 ### 5.2 Store / StoreWithTime
 
+There are two supported native layouts. Official Telegram Desktop uses the compact layout; the
+TDesktop-x64 variant uses a wider `EntrySize`. Offsets for 64-bit builds are:
+
+| Field | Official compact | Wide-entry variant |
+|---|---|---|
+| `type`, `tag` | 0, 1 | 0, 1 |
+| `size` | 2 (3 bytes) | 8 (24 bytes) |
+| `place` | 5 | 32 |
+| `checksum` | 12 | 40 |
+| `key` | 16 | 48 |
+| `time` (`StoreWithTime`) | 32 | 64 |
+| `Store` size | 32 | 64 |
+| `StoreWithTime` size | 48 | 80 |
+
+The wide-entry structs are:
+
 ```cpp
 struct Store {                     // sizeof == 64
     uint8     type;                // +0   0x01
@@ -232,10 +249,11 @@ struct StoreWithTime : Store {     // sizeof == 80
 Both sizes are multiples of 16 because every record has to be encryptable as whole CTR blocks
 (`GoodForEncryption<Record>` in `storage_cache_binlog_reader.h`).
 
-### 5.3 `EntrySize` is 24 bytes, not 3
+### 5.3 `EntrySize` variants
 
 ```cpp
-using EntrySize = std::array<uint64, 3>;
+using EntrySize = std::array<uint8, 3>;   // official Telegram Desktop
+// using EntrySize = std::array<uint64, 3>; // TDesktop-x64 variant
 
 size_type Store::getSize() const {          // storage_cache_types.cpp
     auto result = size_type();
@@ -247,17 +265,19 @@ size_type Store::getSize() const {          // storage_cache_types.cpp
 }
 ```
 
-`ReadTo()` writes the value's successive bytes into `element[0]`, `element[1]`, `element[2]`, so only the
-**first byte of each `uint64`** carries information and the remaining 21 bytes are zero. Folding them back
-together most-significant-last gives
+`ReadTo()` writes the value's successive bytes into `element[0]`, `element[1]`, `element[2]`. In the
+wide variant only the **first byte of each `uint64`** carries information and the remaining 21 bytes
+are zero. Folding the elements back together most-significant-last gives
 
 ```
-size = (raw[24] << 16) | (raw[16] << 8) | raw[8]
+compact: size = raw[2] | (raw[3] << 8) | (raw[4] << 16)
+wide:    size = raw[8] | (raw[16] << 8) | (raw[24] << 16)
 ```
 
-A parser that assumes the old 3-byte field reads `0` for every entry and rejects the file. The upper bound is
-`kDataSizeLimit = 8 << 24` = 128 MiB; the client itself refuses anything over its `maxDataSize` (16 MiB by
-default), but an install with the cache limits removed can legitimately hold more.
+Using the wrong layout changes both field offsets and record framing. `CacheBinlogReader` tries both
+layouts and chooses the longest valid parsed prefix, validating that each wide element fits in one byte.
+Callers can also select a layout explicitly with `CacheRecordFormat`. The reader's hard upper bound for
+a cached value is `kDataSizeLimit = 8 << 24` = 128 MiB.
 
 ### 5.4 Multi* records
 
@@ -284,11 +304,39 @@ Framing stops at the first record that does not make sense (`BinlogWrapper::read
 span for an unknown or oversized record), and a `Store` whose size is impossible is a **hard stop**, because
 `processRecordStoreGeneric()` returns `false` and that ends `readTillEnd`. A binlog truncated by a killed
 process therefore costs the tail, never the whole file.
+`processRecordMultiStore()` applies the same validation to every bundled part; an invalid part stops
+replay before later parts, while entries already replayed from that bundle remain available.
 
 ### 5.6 The `tag` byte
 
-Observed across Telegram Desktop 6–10 and 64Gram: `1` = still image, `2` = animation (GIF / Lottie / WebM),
-`5` = video, `0` = unclassified. It is only used for cache statistics, so the sniffer does not depend on it.
+Telegram's `data/data_types.h` defines `1` = image, `2` = sticker, `3` = voice message,
+`4` = video message, `5` = animation. These are cache statistics categories, not container signatures;
+for example a video does not have to use tag 5. The sniffer remains independent of the tag.
+
+The desktop additionally classifies cache **usage** using `StorageFileLocation::cacheKey()` in
+[`ui/image/image_location.cpp`](https://github.com/telegramdesktop/tdesktop/blob/dev/Telegram/SourceFiles/ui/image/image_location.cpp)
+and the key builders in
+[`data/data_types.cpp`](https://github.com/telegramdesktop/tdesktop/blob/dev/Telegram/SourceFiles/data/data_types.cpp):
+
+| Recognized key | Role |
+|---|---|
+| `high = 0x900 | dc` | user, group or channel profile picture |
+| `high = 0x200 | dc` | generated document thumbnail / cover |
+| `high = (letter << 16) | 0x500 | dc` | document thumbnail |
+| `high = (version << 16) | 0xA00 | dc` | sticker-set thumbnail |
+| `high = 0x300` | audio album cover |
+| `high = (letter << 16) | 0x800 | dc` | photo, potentially one of several size variants |
+| `high = 0x100 | dc` | document/media body; sticker tag 2 takes precedence |
+
+The classifier validates the whole recognized key shape rather than using only its type byte. Web/URL
+keys contain hash bits that could otherwise look like profile or thumbnail markers. Unsupported shapes
+remain unknown, including legacy locations whose role cannot be recovered reliably. Sticker-set thumbnail
+classification in the plain cache is restricted to keys fitting 32 bits to avoid hashed namespaces.
+Streamed keys use their separate big-file namespace. TGS and sticker tag 2 identify sticker content even
+without a known storage key. Explicit thumbnail/profile roles take precedence over sticker tags.
+
+These roles do not describe the visual contents: a logo sent as a photo is still a photo; a small square
+image is not proof of an avatar. Unknown roles are retained, and no classification changes source bytes.
 
 ### 5.7 Timestamps
 
@@ -352,8 +400,11 @@ Storage::Cache::Key Reader::CacheHelper::key(int sliceNumber) const {
 ```
 
 A streamed file therefore lives at keys `baseKey + n`: slice 0 is the *header*, slice `n` holds file bytes
-`[(n-1)·kInSlice, n·kInSlice)`. Values sharing a key high with consecutive lows belong to one file; the
-lowest is the header and everything after it is offset by `(low - baseLow - 1) · kInSlice`.
+`[(n-1)·kInSlice, n·kInSlice)`. `StorageFileLocation::bigFileBaseCacheKey()` in
+`ui/image/image_location.cpp` reserves the bottom nine bits of `low` for slices. The file identity is
+`(high, low & ~0x1FF)`, and the slice number is `low - baseLow`. Many unrelated documents share `high`,
+so grouping by `high` alone merges different files. Clearing the slice bits also recovers the correct
+base when slice 0 has been evicted; the lowest surviving entry must not be assumed to be the header.
 
 ### 6.1 Two serializations
 
@@ -387,7 +438,9 @@ header map (offsets at/after 8 MiB)  ‖  first-slice map (offsets from 0)
 `StreamedFilePlanner` classifies each value and produces a list of `(offset, bytes)` parts;
 `StreamedFileWriter` creates the file at its final length (sparse) and writes each part at its offset, so
 missing ranges stay as zeros and a 4 GB video never becomes a 4 GB array. Coverage is
-`cached bytes / reconstructed size`, which is what `--min-coverage` is compared against.
+`cached bytes / reconstructed size`, counting overlapping ranges once, which is what `--min-coverage`
+is compared against. Reconstructed size means the end of the last known part. The original trailing
+extent is not stored here, so 100% coverage does not prove the original file is complete.
 
 ---
 

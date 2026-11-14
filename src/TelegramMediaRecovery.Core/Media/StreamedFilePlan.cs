@@ -2,262 +2,241 @@ using TelegramMediaRecovery.Core.Cache;
 
 namespace TelegramMediaRecovery.Core.Media;
 
-/// <summary>
-/// One cached value that contributes parts to a streamed file.
-/// </summary>
+/// <summary>One verified cached value. Only offsets and source references are retained.</summary>
 public sealed class SliceFragment
 {
-    public SliceFragment(CacheEntry entry, int sliceNumber, PartMap map, bool isContiguous)
+    private readonly Func<CacheEntry, CacheValueLease?> _open;
+    internal SliceFragment(CacheEntry entry, int sliceNumber, IReadOnlyList<PartMap.Range> parts,
+        bool isContiguous, Func<CacheEntry, CacheValueLease?> open)
     {
         Entry = entry;
         SliceNumber = sliceNumber;
-        Map = map;
+        Parts = parts;
         IsContiguous = isContiguous;
+        _open = open;
     }
-
-    /// <summary>The binlog entry the bytes came from.</summary>
     public CacheEntry Entry { get; }
-
-    /// <summary>0 for the file header, 1..N for the slices after it.</summary>
     public int SliceNumber { get; }
-
-    /// <summary>The parts this value contributes.</summary>
-    public PartMap Map { get; }
-
-    /// <summary>True when the value was stored as plain bytes rather than a map.</summary>
+    public IReadOnlyList<PartMap.Range> Parts { get; }
     public bool IsContiguous { get; }
-
-    /// <summary>True when this fragment is the header slice of its file.</summary>
     public bool IsHeader => SliceNumber == 0;
+    internal CacheValueLease Open() => _open(Entry)
+        ?? throw new InvalidDataException("A cached fragment changed. Scan the data source again.");
+
+    /// <summary>Compatibility accessor that explicitly materializes this value. Use Parts for metadata.</summary>
+    public PartMap Map
+    {
+        get
+        {
+            using var value = Open();
+            var bytes = value.Memory.ToArray();
+            return PartMap.Create(Parts.Select(p => new PartMap.Part(p.Offset, p.Length, bytes.AsMemory(p.ValueOffset, p.Length))), bytes.Length);
+        }
+    }
 }
 
-/// <summary>
-/// The result of reassembling every cached fragment of one streamed file.
-/// </summary>
+/// <summary>A non-overlapping output range pointing into one source value.</summary>
+public readonly record struct StreamedPart(SliceFragment Fragment, long Offset, int Length, int ValueOffset,
+    long OriginOffset, int OriginLength)
+{
+    public long End => Offset + Length;
+    internal StreamedPart Slice(long start, long end) => this with
+    {
+        Offset = start,
+        Length = checked((int)(end - start)),
+        ValueOffset = ValueOffset + checked((int)(start - Offset)),
+    };
+}
+
+/// <summary>A small metadata plan. Media bytes are read only while scanning or writing a fragment.</summary>
 public sealed class StreamedFilePlan
 {
-    public StreamedFilePlan(
-        CacheKey baseKey,
-        IReadOnlyList<SliceFragment> fragments,
-        long fileSize,
-        long cachedBytes,
-        bool hasHeader,
-        bool looksLikeHeaderMap)
+    internal StreamedFilePlan(CacheKey baseKey, IReadOnlyList<SliceFragment> fragments, IReadOnlyList<StreamedPart> ranges,
+        long fileSize, bool hasHeader, bool looksLikeHeaderMap, byte[] head)
     {
         BaseKey = baseKey;
         Fragments = fragments;
+        Ranges = ranges;
         FileSize = fileSize;
-        CachedBytes = cachedBytes;
+        CachedBytes = ranges.Sum(p => (long)p.Length);
         HasHeader = hasHeader;
         LooksLikeHeaderMap = looksLikeHeaderMap;
+        Head = head;
     }
-
-    /// <summary>Lowest key of the file (<c>CacheHelper::key(0)</c>).</summary>
     public CacheKey BaseKey { get; }
-
-    /// <summary>Fragments in the order they were read.</summary>
     public IReadOnlyList<SliceFragment> Fragments { get; }
-
-    /// <summary>Reconstructed size: the end of the last known part.</summary>
+    public IReadOnlyList<StreamedPart> Ranges { get; }
+    public ReadOnlyMemory<byte> Head { get; }
     public long FileSize { get; }
-
-    /// <summary>Number of bytes actually present in the cache.</summary>
     public long CachedBytes { get; }
-
-    /// <summary>True when slice 0 of the file is present.</summary>
     public bool HasHeader { get; }
-
-    /// <summary>
-    /// True when the first fragment is a header map rather than raw bytes, i.e.
-    /// the file is larger than one slice and its metadata was stored separately
-    /// from the body.
-    /// </summary>
     public bool LooksLikeHeaderMap { get; }
-
-    /// <summary>Fraction of the file that is really cached, 0..1.</summary>
-    public double Coverage => FileSize <= 0 ? 0 : Math.Min(1.0, (double)CachedBytes / FileSize);
-
-    /// <summary>True when at least one gap has to be filled with zeros.</summary>
+    public double Coverage => FileSize <= 0 ? 0 : Math.Min(1, (double)CachedBytes / FileSize);
     public bool HasGaps => CachedBytes < FileSize;
+    public StreamedFilePlan WithMinimumSize(long minimumSize) => minimumSize <= FileSize ? this
+        : new StreamedFilePlan(BaseKey, Fragments, Ranges, minimumSize, HasHeader, LooksLikeHeaderMap, Head.ToArray());
 
-    /// <summary>Every part of the plan, sorted by file offset and non-overlapping.</summary>
-    public IReadOnlyList<PartMap.Part> AllParts() =>
-        Fragments
-            .SelectMany(static f => f.Map.Parts)
-            .GroupBy(static p => p.Offset)
-            .Select(static g => g.First())
-            .OrderBy(static p => p.Offset)
-            .ToList();
-
-    /// <inheritdoc />
-    public override string ToString() =>
-        $"{BaseKey}: {CachedBytes}/{FileSize} bytes ({Coverage:P1}) in {Fragments.Count} fragments";
+    /// <summary>Explicitly materializes all parts for callers that need bytes. Recovery uses Ranges instead.</summary>
+    public IReadOnlyList<PartMap.Part> AllParts()
+    {
+        var result = new List<PartMap.Part>(Ranges.Count);
+        foreach (var group in Ranges.GroupBy(p => p.Fragment))
+        {
+            using var value = group.Key.Open();
+            var bytes = value.Memory.ToArray();
+            foreach (var part in group) { result.Add(new PartMap.Part(part.Offset, part.Length, bytes.AsMemory(part.ValueOffset, part.Length))); }
+        }
+        result.Sort((a, b) => a.Offset.CompareTo(b.Offset));
+        return result;
+    }
+    public override string ToString() => $"{BaseKey}: {CachedBytes}/{FileSize} bytes ({Coverage:P1}) in {Fragments.Count} fragments";
 }
 
-/// <summary>
-/// Groups the entries of a streaming database into files and works out how each
-/// cached value contributes to them.
-/// </summary>
-/// <remarks>
-/// The client writes a streamed file at keys <c>baseKey.low + sliceNumber</c>
-/// (<c>media_streaming_reader.cpp</c> &rarr; <c>Reader::CacheHelper::key()</c>), so
-/// entries sharing one <see cref="CacheKey.High"/> with consecutive
-/// <see cref="CacheKey.Low"/> values belong to the same file. The base (slice 0)
-/// is the lowest such value; every later value is slice <c>low - base.low - 1</c>.
-/// <para>
-/// Two serializations exist:
-/// <list type="bullet">
-///   <item><description>
-///     <b>Contiguous</b> &mdash; the raw bytes of the slice, which the reader
-///     splits into part-aligned chunks.
-///   </description></item>
-///   <item><description>
-///     <b>Complex</b> &mdash; an explicit part list, used when only some parts
-///     arrived. The header always uses this form, optionally followed by the first
-///     slice's own map when the header is "good" (see
-///     <see cref="StreamingLayout.ComputeIsGoodHeader"/>).
-///   </description></item>
-/// </list>
-/// </para>
-/// </remarks>
+/// <summary>Resolves overlap priorities while retaining only source ranges. Earlier offsets win; equal offsets keep the longer part.</summary>
+internal sealed class StreamExtentMap
+{
+    private readonly List<StreamedPart> _ranges = [];
+    public IReadOnlyList<StreamedPart> Ranges => _ranges;
+    public IReadOnlyList<StreamedPart> Add(StreamedPart part)
+    {
+        var first = 0;
+        var upper = _ranges.Count;
+        while (first < upper)
+        {
+            var middle = (first + upper) / 2;
+            if (_ranges[middle].End <= part.Offset) { first = middle + 1; } else { upper = middle; }
+        }
+        var last = first;
+        var replacements = new List<StreamedPart>();
+        var writes = new List<StreamedPart>();
+        var cursor = part.Offset;
+        void AddNew(long start, long end)
+        {
+            if (end <= start) { return; }
+            var range = part.Slice(start, end);
+            Append(replacements, range);
+            Append(writes, range);
+        }
+        while (last < _ranges.Count && _ranges[last].Offset < part.End)
+        {
+            var previous = _ranges[last++];
+            if (previous.Offset < part.Offset) { replacements.Add(previous.Slice(previous.Offset, part.Offset)); }
+            var start = Math.Max(part.Offset, previous.Offset);
+            var end = Math.Min(part.End, previous.End);
+            AddNew(cursor, start);
+            if (previous.OriginOffset < part.OriginOffset
+                || (previous.OriginOffset == part.OriginOffset && previous.OriginLength >= part.OriginLength))
+            {
+                replacements.Add(previous.Slice(start, end));
+            }
+            else { AddNew(start, end); }
+            cursor = end;
+            if (previous.End > part.End) { replacements.Add(previous.Slice(part.End, previous.End)); }
+        }
+        AddNew(cursor, part.End);
+        _ranges.RemoveRange(first, last - first);
+        _ranges.InsertRange(first, replacements);
+        return writes;
+    }
+
+    private static void Append(List<StreamedPart> parts, StreamedPart part)
+    {
+        if (parts.Count > 0 && parts[^1] is var previous && previous.Fragment == part.Fragment
+            && previous.End == part.Offset && previous.ValueOffset + previous.Length == part.ValueOffset
+            && previous.OriginOffset == part.OriginOffset && previous.OriginLength == part.OriginLength)
+        {
+            parts[^1] = previous with { Length = previous.Length + part.Length };
+        }
+        else { parts.Add(part); }
+    }
+}
+
+/// <summary>Groups full file identities and inspects one source value at a time.</summary>
 public static class StreamedFilePlanner
 {
-    /// <summary>Groups entries by <see cref="CacheKey.High"/>.</summary>
-    public static IReadOnlyList<IGrouping<ulong, CacheEntry>> GroupByFile(
-        IEnumerable<CacheEntry> entries) =>
-        entries
-            .Where(static e => e.Key.IsValid)
-            .GroupBy(static e => e.Key.High)
-            .ToList();
+    public static IReadOnlyList<IGrouping<CacheKey, CacheEntry>> GroupByFile(IEnumerable<CacheEntry> entries) => entries
+        .Where(e => e.Key.IsValid).GroupBy(e => BaseKey(e.Key)).ToList();
 
-    /// <summary>Builds the reassembly plan for one <c>High</c> group.</summary>
-    /// <param name="group">Entries sharing one <see cref="CacheKey.High"/>.</param>
-    /// <param name="readValue">
-    /// Decrypts one entry. Returning <c>null</c> means the value has already been
-    /// pruned from disk, which happens whenever the client drops a file after the
-    /// binlog was written.
-    /// </param>
-    public static StreamedFilePlan BuildPlan(
-        IGrouping<ulong, CacheEntry> group,
-        Func<CacheEntry, ReadOnlyMemory<byte>?> readValue)
+    public static StreamedFilePlan BuildPlan(IEnumerable<CacheEntry> group, Func<CacheEntry, ReadOnlyMemory<byte>?> readValue) =>
+        BuildVerifiedPlan(group, entry => readValue(entry) is { } memory ? new CacheValueLease(memory) : null);
+
+    internal static StreamedFilePlan BuildVerifiedPlan(IEnumerable<CacheEntry> group, Func<CacheEntry, CacheValueLease?> open,
+        Action<StreamedPart, ReadOnlyMemory<byte>>? consume = null, CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(group);
-        ArgumentNullException.ThrowIfNull(readValue);
-
-        var ordered = group.OrderBy(static e => e.Key.Low).ToList();
-        var baseKey = ordered[0].Key;
-
-        var fragments = new List<SliceFragment>(ordered.Count);
-        var maps = new List<PartMap>();
-        long fileSize = 0;
-        long cachedBytes = 0;
-        var hasHeader = false;
+        var ordered = group.OrderBy(e => e.Key.Low).ToArray();
+        if (ordered.Length == 0) { throw new ArgumentException("A streamed file needs at least one entry.", nameof(group)); }
+        var baseKey = BaseKey(ordered[0].Key);
+        var fragments = new List<SliceFragment>();
+        var extents = new StreamExtentMap();
         var looksLikeHeaderMap = false;
-
-        for (var index = 0; index < ordered.Count; index++)
+        var head = Array.Empty<byte>();
+        foreach (var entry in ordered)
         {
-            var entry = ordered[index];
-            var maybeValue = readValue(entry);
-            if (maybeValue is not { } value || value.Length == 0)
+            cancellationToken.ThrowIfCancellationRequested();
+            var delta = entry.Key.Low - baseKey.Low;
+            if (entry.Key.High != baseKey.High || delta > StreamingLayout.MaxSlices) { continue; }
+            using var value = open(entry);
+            if (value is null || value.Memory.IsEmpty) { continue; }
+            var sliceNumber = (int)delta;
+            var parts = ReadRanges(value.Memory.Span, sliceNumber, out var contiguous, out var headerMap);
+            looksLikeHeaderMap |= headerMap;
+            var fragment = new SliceFragment(entry, sliceNumber, parts, contiguous, open);
+            fragments.Add(fragment);
+            foreach (var part in parts)
             {
-                continue;
-            }
-
-            var sliceNumber = (int)(entry.Key.Low - baseKey.Low);
-            if (sliceNumber < 0 || sliceNumber > StreamingLayout.MaxSlices)
-            {
-                continue;
-            }
-
-            if (index == 0)
-            {
-                hasHeader = true;
-            }
-
-            var sliceOffset = (long)Math.Max(0, sliceNumber - 1) * StreamingLayout.InSlice;
-            PartMap map;
-            bool isContiguous;
-
-            if (sliceNumber == 0)
-            {
-                map = BuildHeaderMap(value.Span, ref looksLikeHeaderMap);
-                isContiguous = !looksLikeHeaderMap;
-            }
-            else if (IsLikelyContiguous(value.Span)
-                     || !PartMap.TryParse(value.Span, StreamingLayout.InSlice, out var sliceMap))
-            {
-                map = PartMap.FromContiguous(value.Span, (int)sliceOffset);
-                isContiguous = true;
-            }
-            else
-            {
-                map = sliceOffset == 0 ? sliceMap : Shift(sliceMap, sliceOffset);
-                isContiguous = false;
-            }
-
-            fragments.Add(new SliceFragment(entry, sliceNumber, map, isContiguous));
-            maps.Add(map);
-
-            foreach (var part in map.Parts)
-            {
-                fileSize = Math.Max(fileSize, part.Offset + (long)part.Length);
-                cachedBytes += part.Length;
+                var candidate = new StreamedPart(fragment, part.Offset, part.Length, part.ValueOffset, part.Offset, part.Length);
+                foreach (var write in extents.Add(candidate))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var bytes = value.Memory.Slice(write.ValueOffset, write.Length);
+                    if (write.Offset == 0) { head = bytes.Span[..Math.Min(bytes.Length, 4096)].ToArray(); }
+                    consume?.Invoke(write, bytes);
+                }
             }
         }
-
-        return new StreamedFilePlan(baseKey, fragments, fileSize, cachedBytes, hasHeader, looksLikeHeaderMap);
+        var ranges = extents.Ranges.ToArray();
+        return new StreamedFilePlan(baseKey, fragments, ranges, ranges.Length == 0 ? 0 : ranges[^1].End,
+            fragments.Any(f => f.IsHeader), looksLikeHeaderMap, head);
     }
 
-    /// <summary>
-    /// Interprets the base value of a file: either a header map (optionally
-    /// followed by the folded-in first slice) or the raw bytes of a whole file
-    /// that fits into the header slice.
-    /// </summary>
-    private static PartMap BuildHeaderMap(ReadOnlySpan<byte> data, ref bool looksLikeHeaderMap)
+    private static CacheKey BaseKey(CacheKey key) => new(key.High, key.Low & ~0x1FFUL);
+
+    private static List<PartMap.Range> ReadRanges(ReadOnlySpan<byte> value, int sliceNumber, out bool contiguous, out bool headerMap)
     {
-        // A raw file always starts with a recognisable container signature while a
-        // map always starts with a small part count, so checking the signature
-        // first removes the ambiguity the client resolves using the true file size.
-        if (LooksLikeRawMedia(data))
+        headerMap = false;
+        var offset = (long)Math.Max(0, sliceNumber - 1) * StreamingLayout.InSlice;
+        var raw = MediaSniffer.LooksLikeMedia(value[..Math.Min(512, value.Length)]);
+        if (sliceNumber == 0 && !raw && PartMap.TryReadRanges(value, 1L << 40, out var header, out var consumed))
         {
-            return PartMap.FromContiguous(data, 0);
-        }
-
-        if (!PartMap.TryParse(data, MaxHeaderOffset, out var header))
-        {
-            return PartMap.FromContiguous(data, 0);
-        }
-
-        looksLikeHeaderMap = true;
-
-        // A "good header" carries the first slice's own map right after the header
-        // map. That second map's offsets already start at 0, so it can be merged
-        // in as is. Anything left over is treated as raw bytes at offset 0.
-        if (header.Consumed >= data.Length)
-        {
+            headerMap = true;
+            contiguous = false;
+            if (consumed < value.Length)
+            {
+                if (PartMap.TryReadRanges(value[consumed..], StreamingLayout.InSlice, out var included, out _))
+                {
+                    header.AddRange(included.Select(p => p with { ValueOffset = p.ValueOffset + consumed }));
+                }
+                else { header.AddRange(RawRanges(value.Length - consumed, 0, consumed)); }
+            }
             return header;
         }
-
-        var rest = data[header.Consumed..];
-        return PartMap.TryParse(rest, StreamingLayout.InSlice, out var included)
-            ? PartMap.Combine(header, included)
-            : PartMap.CombineWithRaw(header, rest, 0);
+        if (sliceNumber != 0 && !raw && value.Length % StreamingLayout.PartSize != 0
+            && PartMap.TryReadRanges(value, StreamingLayout.InSlice, out var map, out _))
+        {
+            contiguous = false;
+            return map.Select(p => p with { Offset = p.Offset + offset }).ToList();
+        }
+        contiguous = true;
+        return RawRanges(value.Length, offset, 0);
     }
 
-    private const long MaxHeaderOffset = 1L << 40;
-
-    private static PartMap Shift(PartMap map, long delta) => PartMap.Create(
-        map.Parts.Select(p => new PartMap.Part(p.Offset + (int)delta, p.Length, p.Data)),
-        map.Consumed);
-
-    /// <summary>
-    /// True when the value must be plain bytes: either its length is part aligned
-    /// (which is what the client guarantees for a contiguous serialization) or it
-    /// starts with a media signature.
-    /// </summary>
-    private static bool IsLikelyContiguous(ReadOnlySpan<byte> data) =>
-        data.Length % StreamingLayout.PartSize == 0 || LooksLikeRawMedia(data);
-
-    private static bool LooksLikeRawMedia(ReadOnlySpan<byte> data) =>
-        MediaSniffer.LooksLikeMedia(data[..Math.Min(data.Length, 512)]);
+    private static List<PartMap.Range> RawRanges(int length, long fileOffset, int valueOffset)
+    {
+        var ranges = new List<PartMap.Range>();
+        for (var index = 0; index < length; index += StreamingLayout.PartSize)
+        {
+            ranges.Add(new PartMap.Range(fileOffset + index, Math.Min(StreamingLayout.PartSize, length - index), valueOffset + index));
+        }
+        return ranges;
+    }
 }

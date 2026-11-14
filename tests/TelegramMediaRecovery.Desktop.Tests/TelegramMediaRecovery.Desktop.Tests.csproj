@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/TelegramMediaRecovery.Desktop/TelegramMediaRecovery.Desktop.csproj" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="xunit" />
+    <PackageReference Include="xunit.runner.visualstudio"><PrivateAssets>all</PrivateAssets></PackageReference>
+    <Compile Include="../TelegramMediaRecovery.Core.Tests/RecoveryFixture.cs" Link="RecoveryFixture.cs" />
+    <Compile Include="../TelegramMediaRecovery.Core.Tests/BinlogBuilder.cs" Link="BinlogBuilder.cs" />
+    <Using Include="TelegramMediaRecovery.Core.Cache" />
+    <Using Include="TelegramMediaRecovery.Core.Containers" />
+    <Using Include="TelegramMediaRecovery.Core.Crypto" />
+    <Using Include="Xunit" />
+  </ItemGroup>
+</Project>

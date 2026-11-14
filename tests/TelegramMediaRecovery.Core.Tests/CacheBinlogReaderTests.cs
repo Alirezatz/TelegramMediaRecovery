@@ -138,6 +138,52 @@ public sealed class CacheBinlogReaderTests
     }
 
     [Fact]
+    public void ACompactStoreWithoutTimeIsFramedAndAutoDetected()
+    {
+        var key = new CacheKey(0x12345678, 0x98765432);
+        var place = Place(2);
+        var record = BinlogBuilder.CompactStore(key, 0x010203, 0x12345678, place, tag: 5, withTime: false);
+        var result = CacheBinlogReader.Parse(Concat(BinlogBuilder.Header(false), record), 0);
+        var entry = Assert.Single(result.Entries).Value;
+        Assert.Equal(CacheRecordFormat.TelegramDesktop, result.RecordFormat);
+        Assert.Equal(key, entry.Key);
+        Assert.Equal(place, entry.Place);
+        Assert.Equal(0x010203, entry.Size);
+        Assert.Equal(0x12345678u, entry.Checksum);
+        Assert.Equal(5, entry.Tag);
+        Assert.False(result.Truncated);
+    }
+
+    [Fact]
+    public void ACompactStoreWithSizeZeroStopsBeforeLaterRecords()
+    {
+        var good = BinlogBuilder.CompactStore(new CacheKey(1, 1), 100, 1, Place(1));
+        var bad = BinlogBuilder.CompactStore(new CacheKey(2, 1), 0, 1, Place(2));
+        var later = BinlogBuilder.CompactStore(new CacheKey(3, 1), 100, 1, Place(3));
+        var result = CacheBinlogReader.Parse(Concat(BinlogBuilder.Header(true), good, bad, later), 0,
+            format: CacheRecordFormat.TelegramDesktop);
+        Assert.Single(result.Entries);
+        Assert.Equal(1, result.RejectedRecords);
+        Assert.True(result.Truncated);
+    }
+
+    [Theory]
+    [InlineData(CacheRecordFormat.TelegramDesktop)]
+    [InlineData(CacheRecordFormat.WideEntrySize)]
+    public void AnInvalidMultiStorePartStopsBeforeLaterParts(CacheRecordFormat format)
+    {
+        byte[] Store(int index, int size) => format == CacheRecordFormat.TelegramDesktop
+            ? BinlogBuilder.CompactStore(new CacheKey((ulong)index, 1), size, 1, Place((byte)index))
+            : BinlogBuilder.StoreWithTime(new CacheKey((ulong)index, 1), 1, size, 1, Place((byte)index), 1_700_000_000, 1000);
+        var parts = new[] { Store(1, 100), Store(2, 0), Store(3, 100) };
+        var head = new byte[16]; head[0] = 2; head[1] = 3;
+        var result = CacheBinlogReader.Parse(Concat([BinlogBuilder.Header(true), head, .. parts]), 0, format: format);
+        Assert.Single(result.Entries);
+        Assert.Equal(1, result.RejectedRecords);
+        Assert.True(result.Truncated);
+    }
+
+    [Fact]
     public void AStoreWithSizeZeroIsRejected()
     {
         var record = BinlogBuilder.Store(new CacheKey(1, 1), 1, 100, 1, Place(1));

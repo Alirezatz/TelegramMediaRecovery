@@ -44,9 +44,9 @@ public sealed class CacheEntry
     public uint Checksum { get; }
 
     /// <summary>
-    /// Opaque category byte written by the client. Observed values in
-    /// Telegram Desktop 6&ndash;10 / 64Gram: 1 = still image, 2 = animation
-    /// (GIF / Lottie / WebM), 5 = video, 0 = unclassified.
+    /// Category byte written by the client. Telegram's data_types.h defines
+    /// 1 = image, 2 = sticker, 3 = voice message, 4 = video message, 5 = animation.
+    /// Zero and unrecognized tags do not establish a role or a container format.
     /// </summary>
     public byte Tag { get; }
 

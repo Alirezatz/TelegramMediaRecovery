@@ -68,6 +68,7 @@ public static class JsonManifestWriter
                 Kind = i.Format.Kind.ToString(),
                 Extension = i.Format.Extension,
                 MimeType = i.Format.MimeType,
+                CacheUsage = i.CacheUsage.ToString(),
                 Sha256 = i.Sha256,
                 Fragments = i.FragmentCount,
                 Partial = i.IsPartial,
@@ -235,6 +236,7 @@ public static class JsonManifestWriter
         public required string Extension { get; init; }
 
         public required string MimeType { get; init; }
+        public required string CacheUsage { get; init; }
 
         public string? Sha256 { get; init; }
 

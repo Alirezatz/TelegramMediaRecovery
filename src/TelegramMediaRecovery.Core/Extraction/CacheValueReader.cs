@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Security.Cryptography;
 using TelegramMediaRecovery.Core.Cache;
 using TelegramMediaRecovery.Core.Containers;
@@ -23,26 +24,39 @@ public sealed class CacheValueReader(
     IReadOnlyList<string> versionDirectories,
     Action<string>? log = null)
 {
+    private static readonly ArrayPool<byte> Buffers = ArrayPool<byte>.Create(16 * 1024 * 1024, 2);
     private readonly LocalKey _key = key;
     private readonly IReadOnlyList<string> _versionDirectories = versionDirectories;
     private readonly Action<string>? _log = log;
 
     /// <summary>Number of lookups that had to fall back to another version folder.</summary>
-    public int FallbackHits { get; private set; }
+    private int _fallbackHits;
+    public int FallbackHits => _fallbackHits;
 
     /// <summary>Number of place files that could not be found at all.</summary>
-    public int MissingFiles { get; private set; }
+    private int _missingFiles;
+    public int MissingFiles => _missingFiles;
 
     /// <summary>Number of place files that existed but failed the checksum.</summary>
-    public int ChecksumFailures { get; private set; }
+    private int _checksumFailures;
+    public int ChecksumFailures => _checksumFailures;
 
     /// <summary>Number of place files that did not open with our local key.</summary>
-    public int WrongKeyFiles { get; private set; }
+    private int _wrongKeyFiles;
+    public int WrongKeyFiles => _wrongKeyFiles;
 
     /// <summary>
     /// Reads the value of <paramref name="entry"/> and verifies its checksum.
     /// </summary>
     public ReadOnlyMemory<byte>? Read(CacheEntry entry)
+    {
+        using var value = Open(entry);
+        if (value is null) { return null; }
+        return value.Memory.ToArray();
+    }
+
+    /// <summary>Verifies a value in pooled memory. Dispose before reading another large value.</summary>
+    public CacheValueLease? Open(CacheEntry entry, CancellationToken cancellationToken = default)
     {
         if (entry.Size == 0)
         {
@@ -51,9 +65,10 @@ public sealed class CacheValueReader(
 
         var sawFile = false;
 
+        var relative = entry.Place.ToRelativePath().Replace('/', Path.DirectorySeparatorChar);
         for (var i = 0; i < _versionDirectories.Count; i++)
         {
-            var relative = entry.Place.ToRelativePath().Replace('/', Path.DirectorySeparatorChar);
+            cancellationToken.ThrowIfCancellationRequested();
             var path = Path.Combine(_versionDirectories[i], relative);
             if (!File.Exists(path))
             {
@@ -62,7 +77,8 @@ public sealed class CacheValueReader(
 
             sawFile = true;
 
-            byte[] value;
+            var buffer = Buffers.Rent(entry.Size);
+            var transferred = false;
             try
             {
                 using var file = TdefFile.Open(path, _key);
@@ -72,11 +88,19 @@ public sealed class CacheValueReader(
                     continue;
                 }
 
-                value = file.Read(0, entry.Size);
+                file.Read(0, buffer.AsSpan(0, entry.Size), cancellationToken);
+                if (XxHash32.Compute(buffer.AsSpan(0, entry.Size)) != entry.Checksum)
+                {
+                    Interlocked.Increment(ref _checksumFailures);
+                    continue;
+                }
+                if (i > 0) { Interlocked.Increment(ref _fallbackHits); }
+                transferred = true;
+                return new CacheValueLease(buffer.AsMemory(0, entry.Size), () => Buffers.Return(buffer, clearArray: true));
             }
             catch (Containers.WrongKeyException)
             {
-                WrongKeyFiles++;
+                Interlocked.Increment(ref _wrongKeyFiles);
                 continue;
             }
             catch (Exception ex) when (ex is IOException or InvalidDataException or EndOfStreamException
@@ -86,27 +110,19 @@ public sealed class CacheValueReader(
                 continue;
             }
 
-            if (XxHash32.Compute(value) != entry.Checksum)
+            finally
             {
-                ChecksumFailures++;
-                continue;
+                if (!transferred) { Buffers.Return(buffer, clearArray: true); }
             }
-
-            if (i > 0)
-            {
-                FallbackHits++;
-            }
-
-            return value;
         }
 
         if (sawFile)
         {
-            ChecksumFailures++;
+            Interlocked.Increment(ref _checksumFailures);
         }
         else
         {
-            MissingFiles++;
+            Interlocked.Increment(ref _missingFiles);
         }
 
         return null;
@@ -128,7 +144,7 @@ public sealed class CacheValueReader(
         }
         catch (Containers.WrongKeyException)
         {
-            WrongKeyFiles++;
+            Interlocked.Increment(ref _wrongKeyFiles);
         }
         catch (Exception ex) when (ex is IOException or InvalidDataException or EndOfStreamException
                                        or CryptographicException)

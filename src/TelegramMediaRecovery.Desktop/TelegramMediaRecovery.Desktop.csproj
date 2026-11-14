@@ -11,6 +11,8 @@
 
   <ItemGroup>
     <ProjectReference Include="..\TelegramMediaRecovery.Core\TelegramMediaRecovery.Core.csproj" />
+    <PackageReference Include="SkiaSharp" />
+    <PackageReference Include="SkiaSharp.Skottie" />
   </ItemGroup>
 
 </Project>

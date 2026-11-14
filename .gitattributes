@@ -1,4 +1,6 @@
 ﻿# Auto-generated Visual Studio files
+* text=auto eol=lf
+
 *.binlog
 *.opendb
 *.dbmdl

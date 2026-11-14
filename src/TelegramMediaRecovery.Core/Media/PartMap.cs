@@ -22,11 +22,13 @@ namespace TelegramMediaRecovery.Core.Media;
 /// </remarks>
 public sealed class PartMap
 {
+    /// <summary>A cached part's output extent and offset inside its source value, without retaining bytes.</summary>
+    public readonly record struct Range(long Offset, int Length, int ValueOffset);
     /// <summary>A part of the reconstructed file.</summary>
     /// <param name="Offset">File-absolute offset of the part.</param>
     /// <param name="Length">Length in bytes.</param>
     /// <param name="Data">The bytes themselves.</param>
-    public readonly record struct Part(int Offset, int Length, ReadOnlyMemory<byte> Data);
+    public readonly record struct Part(long Offset, int Length, ReadOnlyMemory<byte> Data);
 
     private PartMap(List<Part> parts, int consumed)
     {
@@ -38,9 +40,8 @@ public sealed class PartMap
     public static PartMap Create(IEnumerable<Part> parts, int consumed) => new([.. parts], consumed);
 
     /// <summary>
-    /// Merges two maps, keeping the first part found at any given offset. This is
-    /// exactly what the reader does with <c>PartsMap::try_emplace</c>, and it is
-    /// what makes a header map and a folded-in first slice coexist.
+    /// Merges a header and a folded-in slice. Recovery keeps the longest available
+    /// bytes at any shared offset, so a short header cannot discard a fuller body part.
     /// </summary>
     public static PartMap Combine(PartMap first, PartMap? second)
     {
@@ -52,7 +53,7 @@ public sealed class PartMap
         var merged = first.Parts
             .Concat(second.Parts)
             .GroupBy(static p => p.Offset)
-            .Select(static g => g.First())
+            .Select(static g => g.OrderByDescending(p => p.Length).First())
             .OrderBy(static p => p.Offset)
             .ToList();
 
@@ -60,7 +61,7 @@ public sealed class PartMap
     }
 
     /// <summary>Appends raw bytes at <paramref name="fileOffset"/> and merges them in.</summary>
-    public static PartMap CombineWithRaw(PartMap first, ReadOnlySpan<byte> raw, int fileOffset) =>
+    public static PartMap CombineWithRaw(PartMap first, ReadOnlySpan<byte> raw, long fileOffset) =>
         Combine(first, FromContiguous(raw, fileOffset));
 
     /// <summary>The parts, sorted by offset and without overlaps.</summary>
@@ -73,7 +74,7 @@ public sealed class PartMap
     public long TotalBytes => Parts.Sum(p => (long)p.Length);
 
     /// <summary>Offsets of the parts, used by <see cref="StreamingLayout.ComputeIsGoodHeader"/>.</summary>
-    public IEnumerable<int> Offsets => Parts.Select(p => p.Offset);
+    public IEnumerable<long> Offsets => Parts.Select(p => p.Offset);
 
     /// <summary>An empty map.</summary>
     public static PartMap Empty { get; } = new([], 0);
@@ -91,6 +92,17 @@ public sealed class PartMap
     public static bool TryParse(ReadOnlySpan<byte> data, long maxSize, out PartMap map)
     {
         map = Empty;
+        if (!TryReadRanges(data, maxSize, out var ranges, out var consumed)) { return false; }
+        var parts = new List<Part>(ranges.Count);
+        foreach (var part in ranges) { parts.Add(new Part(part.Offset, part.Length, data.Slice(part.ValueOffset, part.Length).ToArray())); }
+        map = new PartMap(parts, consumed);
+        return true;
+    }
+
+    internal static bool TryReadRanges(ReadOnlySpan<byte> data, long maxSize, out List<Range> ranges, out int consumed)
+    {
+        ranges = [];
+        consumed = 0;
 
         if (data.Length < 4)
         {
@@ -104,7 +116,7 @@ public sealed class PartMap
             return false;
         }
 
-        var parts = new List<Part>((int)count);
+        var parts = new List<Range>((int)count);
         var offset = 4;
 
         for (var i = 0; i < count; i++)
@@ -114,7 +126,7 @@ public sealed class PartMap
                 return false;
             }
 
-            var partOffset = BinaryPrimitives.ReadInt32LittleEndian(data[offset..]);
+            var partOffset = (long)BinaryPrimitives.ReadUInt32LittleEndian(data[offset..]);
             offset += 4;
             var partSize = BinaryPrimitives.ReadInt32LittleEndian(data[offset..]);
             offset += 4;
@@ -124,17 +136,18 @@ public sealed class PartMap
                 || partOffset >= maxSize
                 || partSize > maxSize
                 || partOffset + (long)partSize > maxSize
-                || offset + partSize > data.Length)
+                || partSize > data.Length - offset)
             {
                 return false;
             }
 
-            parts.Add(new Part(partOffset, partSize, data.Slice(offset, partSize).ToArray()));
+            parts.Add(new Range(partOffset, partSize, offset));
             offset += partSize;
         }
 
         parts.Sort(static (left, right) => left.Offset.CompareTo(right.Offset));
-        map = new PartMap(parts, offset);
+        ranges = parts;
+        consumed = offset;
         return true;
     }
 
@@ -142,7 +155,7 @@ public sealed class PartMap
     /// Splits a contiguously serialised value into part-aligned chunks, mirroring
     /// the loop in <c>ParseCachedMap()</c>.
     /// </summary>
-    public static PartMap FromContiguous(ReadOnlySpan<byte> data, int fileOffset)
+    public static PartMap FromContiguous(ReadOnlySpan<byte> data, long fileOffset)
     {
         var parts = new List<Part>();
         for (var offset = 0; offset < data.Length; offset += StreamingLayout.PartSize)

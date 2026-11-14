@@ -3,16 +3,19 @@ using System.Buffers.Binary;
 namespace TelegramMediaRecovery.Core.Cache;
 
 /// <summary>
-/// Native (x86-64, little-endian) memory layout of the binlog record structs.
+/// Native (x86-64, little-endian) memory layout of the wide-entry binlog record structs.
 /// </summary>
 /// <remarks>
-/// Every offset here was derived from the C++ definitions in lib_storage
-/// <c>storage/cache/storage_cache_types.h</c> by applying the MSVC/Itanium
-/// alignment rules that the build uses. They are asserted against real binlogs
-/// by the unit tests, and the most important one &mdash; that <c>EntrySize</c> is
-/// <c>std::array&lt;uint64, 3&gt;</c> and therefore <b>24</b> bytes wide rather
-/// than 3 &mdash; is what makes the difference between parsing 86 085 entries and
-/// parsing none.
+/// These offsets describe the TDesktop-x64/lib_storage variant, whose
+/// <c>EntrySize</c> is <c>std::array&lt;uint64, 3&gt;</c> (24 bytes).
+/// Official Telegram Desktop uses <c>std::array&lt;uint8, 3&gt;</c> (3 bytes)
+/// and 32/48-byte store records. <see cref="CacheBinlogReader"/> detects
+/// both layouts; these public constants retain their original wide-layout meaning.
+/// Sources: desktop-app/lib_storage and TDesktop-x64/lib_storage,
+/// <c>storage/cache/storage_cache_types.h</c>: <c>Store</c>, <c>StoreWithTime</c>,
+/// <c>Store::getSize()</c> / <c>Store::setSize()</c> in <c>storage_cache_types.cpp</c>.
+/// The reader is <c>DatabaseObject::processRecordStoreGeneric()</c> in
+/// <c>storage/cache/storage_cache_database_object.cpp</c>.
 /// <code>
 /// struct Store {                    // sizeof == 64
 ///     uint8      type;              // +0
@@ -42,6 +45,23 @@ namespace TelegramMediaRecovery.Core.Cache;
 /// </remarks>
 public static class CacheRecordLayout
 {
+    /// <summary>
+    /// Official desktop-app/lib_storage <c>Store</c> field offsets from
+    /// <c>storage/cache/storage_cache_types.h</c>, interpreted by
+    /// <c>Store::getSize()</c> and <c>DatabaseObject::processRecordStoreGeneric()</c>.
+    /// EntrySize is three adjacent bytes; StoreWithTime appends 16 bytes.
+    /// </summary>
+    internal static StoreFields FieldsFor(CacheRecordFormat format) => format == CacheRecordFormat.WideEntrySize
+        ? new(Store, EntrySizeOffset, 8, PlaceOffset, ChecksumOffset, KeyOffset)
+        : new(32, 2, 1, 5, 12, 16);
+
+    internal readonly record struct StoreFields(int StoreSize, int SizeOffset, int SizeStride,
+        int PlaceOffset, int ChecksumOffset, int KeyOffset)
+    {
+        public int ReadSize(ReadOnlySpan<byte> record) => record[SizeOffset]
+            | (record[SizeOffset + SizeStride] << 8) | (record[SizeOffset + 2 * SizeStride] << 16);
+    }
+
     /// <summary>Size of <c>Store</c>.</summary>
     public const int Store = 64;
 

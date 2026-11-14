@@ -62,7 +62,7 @@ public sealed class CommandLineArguments
     /// <summary>Cap on files per database; 0 means unlimited.</summary>
     public int Limit { get; private set; }
 
-    /// <summary>Worker threads; 0 means one per CPU.</summary>
+    /// <summary>Worker threads; 0 uses the CPU count capped at four.</summary>
     public int Threads { get; private set; }
 
     /// <summary>Print an inventory and exit without writing anything.</summary>
@@ -194,7 +194,7 @@ public sealed class CommandLineArguments
               --dated-names         prefix file names with the estimated date
               --live-version-only   ignore older cache version folders
               --limit <n>           stop after n files per database
-              --threads <n>         worker threads (default: one per CPU)
+              --threads <n>         worker threads (default: CPU count, capped at 4)
               --json                also write manifest.json
               --html                also write index.html
               --list                print an inventory and exit

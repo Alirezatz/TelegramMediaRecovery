@@ -180,27 +180,8 @@ public sealed class ExtractionEngine(ExtractionOptions options)
     }
 
     /// <summary>Writes the manifest and, if asked, the HTML gallery.</summary>
-    private void WriteReports(ExtractionReport report)
-    {
-        Directory.CreateDirectory(report.OutputDirectory);
-
-        if (_options.WriteManifest)
-        {
-            CsvManifestWriter.WriteCsv(Path.Combine(report.OutputDirectory, "manifest.csv"), report);
-            CsvManifestWriter.WriteSkippedCsv(Path.Combine(report.OutputDirectory, "skipped.csv"), report);
-        }
-
-        if (_options.WriteJsonManifest)
-        {
-            JsonManifestWriter.WriteJson(Path.Combine(report.OutputDirectory, "manifest.json"), report);
-        }
-
-        if (_options.WriteHtmlReport)
-        {
-            HtmlReportWriter.Write(Path.Combine(report.OutputDirectory, "index.html"), report);
-        }
-    }
-
+    private void WriteReports(ExtractionReport report) =>
+        RecoveryReportWriter.Write(report, _options.WriteManifest, _options.WriteJsonManifest, _options.WriteHtmlReport);
     private bool SelectsSource(CacheDatabase database)
     {
         if (_options.Accounts.Count > 0
@@ -213,86 +194,6 @@ public sealed class ExtractionEngine(ExtractionOptions options)
                || _options.Databases.Any(d => string.Equals(d, database.Name, StringComparison.OrdinalIgnoreCase));
     }
 
-    private sealed record BinlogScan(
-        List<CacheEntry> Entries,
-        IReadOnlyList<string> VersionDirectories,
-        int LiveVersion,
-        bool TrackEstimatedTime,
-        int RecordsRead,
-        int LiveEntryCount,
-        IReadOnlyList<string> Warnings);
-
-    private BinlogScan ReadBinlogs(CacheDatabase database, LocalKey localKey)
-    {
-        var warnings = new List<string>();
-        var versions = database.Versions();
-
-        if (versions.Count == 0)
-        {
-            warnings.Add("no binlog in any version folder");
-            return new BinlogScan([], [], -1, false, 0, 0, warnings);
-        }
-
-        var merged = new Dictionary<CacheKey, CacheEntry>();
-        var recordsRead = 0;
-        var liveEntryCount = 0;
-        var trackTime = false;
-
-        for (var i = 0; i < versions.Count; i++)
-        {
-            var version = versions[i];
-
-            BinlogParseResult parsed;
-            try
-            {
-                using var file = TdefFile.Open(version.BinlogPath, localKey);
-                parsed = CacheBinlogReader.Parse(file.ReadAll(), version.Number, _options.MaxEntrySize);
-            }
-            catch (Exception ex) when (ex is IOException or InvalidDataException
-                                           or WrongKeyException or System.Security.Cryptography.CryptographicException)
-            {
-                warnings.Add($"version {version.Number}: {ex.Message}");
-                continue;
-            }
-
-            recordsRead += parsed.RecordsRead;
-            if (i == 0)
-            {
-                trackTime = parsed.Header.TrackEstimatedTime;
-                liveEntryCount = parsed.Entries.Count;
-            }
-
-            if (parsed.RejectedRecords > 0 || parsed.Truncated)
-            {
-                warnings.Add(
-                    $"version {version.Number}: {parsed.Entries.Count} live entries"
-                    + (parsed.RejectedRecords > 0 ? $", {parsed.RejectedRecords} record(s) rejected" : string.Empty)
-                    + (parsed.Truncated
-                        ? $", parsing stopped at byte {parsed.StoppedAtOffset} of {parsed.PayloadLength}"
-                        : string.Empty));
-            }
-
-            // The live version wins; stale folders only fill in what is missing.
-            foreach (var (key, entry) in parsed.Entries)
-            {
-                if (i == 0)
-                {
-                    merged[key] = entry;
-                }
-                else
-                {
-                    merged.TryAdd(key, entry);
-                }
-            }
-        }
-
-        return new BinlogScan(
-            [.. merged.Values],
-            [.. versions.Select(static v => v.VersionPath)],
-            versions[0].Number,
-            trackTime,
-            recordsRead,
-            liveEntryCount,
-            warnings);
-    }
+    private CacheIndexSnapshot ReadBinlogs(CacheDatabase database, LocalKey localKey) =>
+        CacheIndexReader.Read(database, localKey, _options.IncludeOldVersions, _options.MaxEntrySize, _options.CancellationToken);
 }

@@ -83,7 +83,7 @@ public static class LocalBlobCipher
     {
         var padded = ((payload.Length + 4) + 15) & ~15;
         var plain = new byte[padded];
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(plain, (uint)padded);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(plain, (uint)(payload.Length + 4));
         payload.CopyTo(plain.AsSpan(4));
         RandomNumberGenerator.Fill(plain.AsSpan(4 + payload.Length));
 

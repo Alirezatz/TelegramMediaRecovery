@@ -1,101 +1,89 @@
+using System.Buffers;
 using System.Security.Cryptography;
+using TelegramMediaRecovery.Core.Cache;
 
 namespace TelegramMediaRecovery.Core.Media;
 
-/// <summary>
-/// Writes a reconstructed streamed file to disk without ever holding the whole
-/// file in memory.
-/// </summary>
-/// <remarks>
-/// A 4 GB video must not become a 4 GB <c>byte[]</c>. The file is created at its
-/// final length (sparse, so unvisited ranges cost nothing) and every part is
-/// written at its offset; the gaps between them read back as zeros, which is
-/// exactly what the player itself would see for the same half-cached file.
-/// <para>
-/// Parts are visited in ascending order so the SHA-256 can be computed in a
-/// single sequential pass.
-/// </para>
-/// </remarks>
+/// <summary>Writes verified ranges with at most one source value in memory, then hashes the actual output.</summary>
 public static class StreamedFileWriter
 {
-    private const int BufferSize = 1 << 20;
-
-    /// <summary>
-    /// Materialises <paramref name="plan"/> at <paramref name="destination"/>.
-    /// </summary>
-    /// <returns>The lowercase hex SHA-256 of the bytes on disk.</returns>
-    public static string Write(StreamedFilePlan plan, string destination)
+    public static string Write(StreamedFilePlan plan, string destination, CancellationToken cancellationToken = default, bool computeHash = true)
     {
-        ArgumentNullException.ThrowIfNull(plan);
-
-        using var stream = new FileStream(
-            destination,
-            FileMode.Create,
-            FileAccess.ReadWrite,
-            FileShare.None,
-            bufferSize: BufferSize,
-            FileOptions.SequentialScan);
-
-        stream.SetLength(Math.Max(plan.FileSize, 0));
-
-        using var sha = SHA256.Create();
-        var buffer = new byte[BufferSize];
-        long cursor = 0;
-
-        foreach (var part in plan.AllParts())
+        var created = false;
+        try
         {
-            if (part.Offset > cursor)
-            {
-                stream.Seek(cursor, SeekOrigin.Begin);
-                HashRange(stream, sha, buffer, part.Offset - cursor);
-            }
-
-            var bytes = part.Data.Span;
-            if (bytes.Length > 0)
-            {
-                stream.Seek(part.Offset, SeekOrigin.Begin);
-                if (bytes.Length <= buffer.Length)
-                {
-                    bytes.CopyTo(buffer);
-                    sha.TransformBlock(buffer, 0, bytes.Length, null, 0);
-                    stream.Write(buffer, 0, bytes.Length);
-                }
-                else
-                {
-                    var copy = bytes.ToArray();
-                    sha.TransformBlock(copy, 0, copy.Length, null, 0);
-                    stream.Write(copy, 0, copy.Length);
-                }
-            }
-
-            cursor = Math.Max(cursor, part.Offset + part.Length);
+            using var stream = Create(destination);
+            created = true;
+            CopyTo(plan, stream, cancellationToken);
+            return computeHash ? Hash(stream, cancellationToken) : string.Empty;
         }
-
-        if (plan.FileSize > cursor)
+        catch
         {
-            stream.Seek(cursor, SeekOrigin.Begin);
-            HashRange(stream, sha, buffer, plan.FileSize - cursor);
+            if (created) { TryDelete(destination); }
+            throw;
         }
-
-        sha.TransformFinalBlock([], 0, 0);
-        stream.Flush();
-        return Convert.ToHexString(sha.Hash!).ToLowerInvariant();
     }
 
-    private static void HashRange(FileStream stream, HashAlgorithm sha, byte[] buffer, long length)
+    internal static StreamedWriteResult Recover(IEnumerable<CacheEntry> entries, Func<CacheEntry, CacheValueLease?> open,
+        string destination, long minimumSize, CancellationToken cancellationToken)
     {
-        var remaining = length;
-        while (remaining > 0)
+        using var stream = Create(destination);
+        var plan = StreamedFilePlanner.BuildVerifiedPlan(entries, open, (part, bytes) =>
         {
-            var chunk = (int)Math.Min(remaining, buffer.Length);
-            var read = stream.Read(buffer, 0, chunk);
-            if (read == 0)
-            {
-                break;
-            }
-
-            sha.TransformBlock(buffer, 0, read, null, 0);
-            remaining -= read;
+            stream.Position = part.Offset;
+            stream.Write(bytes.Span);
+        }, cancellationToken).WithMinimumSize(minimumSize);
+        if (plan.Fragments.Count == 0 || plan.CachedBytes == 0)
+        {
+            throw new InvalidDataException("The cached fragments are no longer readable. Scan the data source again.");
         }
+        stream.SetLength(plan.FileSize);
+        return new StreamedWriteResult(plan, Hash(stream, cancellationToken));
+    }
+
+    internal static void CopyTo(StreamedFilePlan plan, Stream output, CancellationToken token)
+    {
+        output.SetLength(plan.FileSize);
+        foreach (var group in plan.Ranges.GroupBy(p => p.Fragment))
+        {
+            token.ThrowIfCancellationRequested();
+            using var value = group.Key.Open();
+            foreach (var part in group)
+            {
+                token.ThrowIfCancellationRequested();
+                output.Position = part.Offset;
+                output.Write(value.Memory.Span.Slice(part.ValueOffset, part.Length));
+            }
+        }
+    }
+
+    private static FileStream Create(string destination) => new(destination, FileMode.CreateNew,
+        FileAccess.ReadWrite, FileShare.None, 64 * 1024, FileOptions.RandomAccess);
+
+    private static void TryDelete(string destination)
+    {
+        try { File.Delete(destination); }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+    }
+
+    private static string Hash(Stream stream, CancellationToken token)
+    {
+        stream.Position = 0;
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
+        try
+        {
+            int read;
+            while ((read = stream.Read(buffer)) > 0)
+            {
+                token.ThrowIfCancellationRequested();
+                hash.AppendData(buffer, 0, read);
+            }
+            return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
+        }
+        finally { ArrayPool<byte>.Shared.Return(buffer, clearArray: true); }
     }
 }
+
+internal sealed record StreamedWriteResult(StreamedFilePlan Plan, string Sha256);

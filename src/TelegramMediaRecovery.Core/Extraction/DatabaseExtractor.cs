@@ -103,7 +103,7 @@ internal sealed class DatabaseExtractor(
             {
                 token.ThrowIfCancellationRequested();
 
-                var plan = StreamedFilePlanner.BuildPlan(group, entry => reader.Read(entry));
+                var plan = StreamedFilePlanner.BuildVerifiedPlan(group, entry => reader.Open(entry, token), cancellationToken: token);
 
                 lock (_claimedKeys)
                 {
@@ -291,7 +291,7 @@ internal sealed class DatabaseExtractor(
     }
 
     private int Degree() =>
-        options.MaxDegreeOfParallelism > 0 ? options.MaxDegreeOfParallelism : Environment.ProcessorCount;
+        options.MaxDegreeOfParallelism > 0 ? options.MaxDegreeOfParallelism : Math.Clamp(Environment.ProcessorCount, 1, 4);
 
     private IReadOnlyList<CacheEntry> Filter(IEnumerable<CacheEntry> entries)
     {
@@ -374,6 +374,7 @@ internal sealed class DatabaseExtractor(
             Size = value.Length,
             Coverage = 1.0,
             Format = format,
+            CacheUsage = CacheUsageClassifier.Classify(entry.Key, entry.Tag, false, format),
             OutputPath = path,
             Sha256 = digest,
             Date = entry.EstimatedLastUse,
@@ -385,12 +386,11 @@ internal sealed class DatabaseExtractor(
 
     private void WriteStream(StreamedFilePlan plan)
     {
-        var firstFragment = plan.Fragments.FirstOrDefault(f => f.Map.Parts.Any(p => p.Offset == 0))
+        var firstFragment = plan.Fragments.FirstOrDefault(f => f.Parts.Any(p => p.Offset == 0))
                             ?? plan.Fragments.FirstOrDefault()
                             ?? throw new InvalidOperationException("empty plan");
 
-        PartMap.Part? headPart = firstFragment.Map.Parts.FirstOrDefault(p => p.Offset == 0);
-        var head = headPart.HasValue ? headPart.Value.Data.Span : ReadOnlySpan<byte>.Empty;
+        var head = plan.Head.Span;
         var format = MediaSniffer.Detect(head);
 
         if (format.Kind == MediaKind.Document && !options.KeepUnknownContent)
@@ -405,13 +405,6 @@ internal sealed class DatabaseExtractor(
             return;
         }
 
-        var digest = ComputeStreamDigest(plan);
-        if (!dedup.TryAdd(digest))
-        {
-            Skip(SkipReason.Duplicate, firstFragment.Entry, digest);
-            return;
-        }
-
         var partial = options.MarkPartialFiles && plan.HasGaps;
         var path = namer.NextPath(
             Account, Database, format.Kind, format.Extension,
@@ -419,7 +412,13 @@ internal sealed class DatabaseExtractor(
 
         try
         {
-            var written = StreamedFileWriter.Write(plan, path);
+            var written = StreamedFileWriter.Write(plan, path, token, options.ComputeHashes);
+            if (options.ComputeHashes && !dedup.TryAdd(written))
+            {
+                File.Delete(path);
+                Skip(SkipReason.Duplicate, firstFragment.Entry, written);
+                return;
+            }
             counters.FilesWritten++;
             counters.BytesWritten += plan.FileSize;
 
@@ -435,6 +434,7 @@ internal sealed class DatabaseExtractor(
                 Size = plan.FileSize,
                 Coverage = plan.Coverage,
                 Format = format,
+                CacheUsage = CacheUsageClassifier.Classify(plan.BaseKey, firstFragment.Entry.Tag, true, format),
                 OutputPath = path,
                 Sha256 = options.ComputeHashes ? written : null,
                 Date = firstFragment.Entry.EstimatedLastUse,
@@ -443,7 +443,7 @@ internal sealed class DatabaseExtractor(
                 RelativeRoot = namer.Root,
             });
         }
-        catch (IOException ex)
+        catch (Exception ex) when (ex is IOException or InvalidDataException)
         {
             Skip(SkipReason.Unknown, firstFragment.Entry, ex.Message);
             options.Log?.Invoke($"{plan.BaseKey}: could not write {path}: {ex.Message}");
@@ -530,29 +530,6 @@ internal sealed class DatabaseExtractor(
 
     private string? Hash(ReadOnlySpan<byte> value) =>
         options.ComputeHashes ? Convert.ToHexString(SHA256.HashData(value)).ToLowerInvariant() : null;
-
-    /// <summary>
-    /// Content identity of a streamed file, computed from its part layout instead
-    /// of its bytes.
-    /// </summary>
-    /// <remarks>
-    /// Hashing gigabytes twice (once to de-duplicate, once to write) is wasteful,
-    /// and identical content always produces an identical part layout, so the
-    /// layout is a cheap and collision-free stand-in. The real SHA-256 is computed
-    /// while writing and lands in the manifest.
-    /// </remarks>
-    private static string ComputeStreamDigest(StreamedFilePlan plan)
-    {
-        var builder = new System.Text.StringBuilder();
-        builder.Append(plan.FileSize).Append(':');
-        foreach (var part in plan.AllParts())
-        {
-            builder.Append(part.Offset).Append('+').Append(part.Length).Append(',');
-        }
-
-        var digest = SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(builder.ToString()));
-        return "layout:" + Convert.ToHexString(digest).ToLowerInvariant();
-    }
 
     /// <summary>
     /// Records why a value did not become a file. Both the aggregate counter and

@@ -195,7 +195,7 @@ public sealed class EndToEndTests : IDisposable
             var place = NewPlace(99);
             WritePlaceFile(versionPath, place, video);
             binlog.AddRange(BinlogBuilder.StoreWithTime(
-                new CacheKey(0x777, 0x888),
+                new CacheKey(0x777, 0x10000),
                 5,
                 video.Length,
                 XxHash32.Compute(video),
@@ -309,7 +309,7 @@ public sealed class EndToEndTests : IDisposable
     private static byte[] BigEndianArray(byte[] value)
     {
         var result = new byte[4 + value.Length];
-        BitConverter.TryWriteBytes(result.AsSpan(0, 4), (uint)value.Length);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(result, (uint)value.Length);
         value.CopyTo(result, 4);
         return result;
     }

@@ -93,7 +93,7 @@ public sealed class ExtractionOptions
     /// <summary>Hard cap on how many files a single database may contribute; 0 means no cap.</summary>
     public int MaxFilesPerDatabase { get; init; }
 
-    /// <summary>Number of worker threads; 0 means "one per CPU".</summary>
+    /// <summary>Number of worker threads; 0 uses the CPU count capped at four to bound memory and disk contention.</summary>
     public int MaxDegreeOfParallelism { get; init; }
 
     /// <summary>Also try to recover TDEF files that no live binlog entry references.</summary>
