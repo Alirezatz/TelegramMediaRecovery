@@ -42,7 +42,8 @@ public static class CacheBinlogReader
     public static BinlogParseResult Parse(
         ReadOnlySpan<byte> payload,
         int version,
-        int maxEntrySize = CacheRecordLayout.MaxEntrySize)
+        int maxEntrySize = CacheRecordLayout.MaxEntrySize,
+        CacheRecordFormat format = CacheRecordFormat.Auto)
     {
         if (payload.Length < CacheBasicHeader.Size)
         {
@@ -56,13 +57,21 @@ public static class CacheBinlogReader
             throw new InvalidDataException($"Unsupported cache binlog format {header.Format}.");
         }
 
-        var scanner = new BinlogScanner(
-            payload,
-            header.TrackEstimatedTime,
-            version,
-            maxEntrySize);
-        scanner.Run();
+        if (format != CacheRecordFormat.Auto)
+        {
+            return ParseLayout(payload, header, version, maxEntrySize, format);
+        }
 
+        var standard = ParseLayout(payload, header, version, maxEntrySize, CacheRecordFormat.TelegramDesktop);
+        var wide = ParseLayout(payload, header, version, maxEntrySize, CacheRecordFormat.WideEntrySize);
+        return wide.StoppedAtOffset > standard.StoppedAtOffset ? wide : standard;
+    }
+
+    private static BinlogParseResult ParseLayout(ReadOnlySpan<byte> payload, CacheBasicHeader header,
+        int version, int maxEntrySize, CacheRecordFormat format)
+    {
+        var scanner = new BinlogScanner(payload, header.TrackEstimatedTime, version, maxEntrySize, format);
+        scanner.Run();
         return scanner.BuildResult(header);
     }
 
@@ -83,6 +92,9 @@ public static class CacheBinlogReader
         private readonly int _partSize;
         private readonly int _version;
         private readonly int _maxEntrySize;
+        private readonly CacheRecordFormat _format;
+        private readonly bool _wide;
+        private readonly CacheRecordLayout.StoreFields _fields;
 
         private readonly Dictionary<CacheKey, PendingEntry> _entries;
 
@@ -100,12 +112,14 @@ public static class CacheBinlogReader
             ReadOnlySpan<byte> payload,
             bool trackEstimatedTime,
             int version,
-            int maxEntrySize)
+            int maxEntrySize,
+            CacheRecordFormat format)
         {
             _payload = payload;
-            _partSize = trackEstimatedTime
-                ? CacheRecordLayout.StoreWithTime
-                : CacheRecordLayout.Store;
+            _format = format;
+            _wide = format == CacheRecordFormat.WideEntrySize;
+            _fields = CacheRecordLayout.FieldsFor(format);
+            _partSize = _fields.StoreSize + (trackEstimatedTime ? 16 : 0);
             _version = version;
             _maxEntrySize = maxEntrySize;
             _entries = [];
@@ -126,7 +140,7 @@ public static class CacheBinlogReader
                             }
 
                             var record = _payload.Slice(_offset, _partSize);
-                            if (!IsUsableSize(CacheRecordLayout.EntrySizeOf(record)))
+                            if (!IsUsableRecord(record))
                             {
                                 // The client treats an impossible size as a hard stop
                                 // (processRecordStoreGeneric returns false, which ends
@@ -154,7 +168,13 @@ public static class CacheBinlogReader
 
                             for (var i = 0; i < count; i++)
                             {
-                                ApplyStore(_payload.Slice(_offset + CacheRecordLayout.MultiHead + (i * _partSize), _partSize));
+                                var part = _payload.Slice(_offset + CacheRecordLayout.MultiHead + (i * _partSize), _partSize);
+                                if (!IsUsableRecord(part))
+                                {
+                                    _rejected++;
+                                    return;
+                                }
+                                ApplyStore(part);
                             }
 
                             _multiStores++;
@@ -239,7 +259,8 @@ public static class CacheBinlogReader
                 _multiRemoves,
                 _multiAccesses,
                 _rejected,
-                Math.Min(_offset, _payload.Length));
+                Math.Min(_offset, _payload.Length),
+                _format);
         }
 
         private CacheKey ReadPartKey(int headOffset, int index) => CacheRecordLayout.PartKeyOf(
@@ -249,16 +270,23 @@ public static class CacheBinlogReader
 
         private void ApplyStore(ReadOnlySpan<byte> record)
         {
-            var withTime = _partSize == CacheRecordLayout.StoreWithTime;
-            var systemTime = withTime ? CacheRecordLayout.SystemTimeOf(record) : 0;
-            var relative = withTime ? CacheRecordLayout.RelativeOf(record) : 0;
+            var baseSize = _fields.StoreSize;
+            var withTime = _partSize > baseSize;
+            var systemTime = withTime ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(record[(baseSize + 8)..]) : 0;
+            var relative = withTime ? System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(record[baseSize..]) : 0;
             Track(relative);
 
-            _entries[CacheRecordLayout.KeyOf(record)] = new PendingEntry
+            var placeOffset = _fields.PlaceOffset;
+            var keyOffset = _fields.KeyOffset;
+            var checksumOffset = _fields.ChecksumOffset;
+            var key = new CacheKey(
+                System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(record[keyOffset..]),
+                System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(record[(keyOffset + 8)..]));
+            _entries[key] = new PendingEntry
             {
-                Place = new PlaceId(CacheRecordLayout.PlaceOf(record)),
-                Size = CacheRecordLayout.EntrySizeOf(record),
-                Checksum = CacheRecordLayout.ChecksumOf(record),
+                Place = new PlaceId(record.Slice(placeOffset, PlaceId.Size).ToArray()),
+                Size = SizeOf(record),
+                Checksum = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(record[checksumOffset..]),
                 Tag = CacheRecordLayout.TagOf(record),
                 StoreSystem = systemTime,
                 StoreRelative = relative,
@@ -275,6 +303,22 @@ public static class CacheBinlogReader
         }
 
         private bool IsUsableSize(int size) => size > 0 && size <= _maxEntrySize;
+
+        private int SizeOf(ReadOnlySpan<byte> record) => _fields.ReadSize(record);
+
+        private bool IsUsableRecord(ReadOnlySpan<byte> record)
+        {
+            if (!IsUsableSize(SizeOf(record)))
+            {
+                return false;
+            }
+
+            // Each uint64 element in the wide layout contains a single byte.
+            // Reject a compact record accidentally interpreted as wide.
+            return !_wide || (System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(record[8..]) <= 255
+                && System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(record[16..]) <= 255
+                && System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(record[24..]) <= 255);
+        }
 
         private bool Fits(int count, int partSize)
         {

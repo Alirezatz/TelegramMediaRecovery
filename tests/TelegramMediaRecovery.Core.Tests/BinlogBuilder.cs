@@ -1,3 +1,5 @@
+using System.Buffers.Binary;
+
 namespace TelegramMediaRecovery.Core.Tests;
 
 /// <summary>
@@ -68,6 +70,29 @@ internal static class BinlogBuilder
         place.Bytes.CopyTo(record.AsSpan(PlaceOffset));
         BitConverter.TryWriteBytes(record.AsSpan(ChecksumOffset, 4), checksum);
         WriteKey(record, key);
+        return record;
+    }
+
+    /// <summary>
+    /// Official desktop-app/lib_storage <c>StoreWithTime</c> from
+    /// <c>storage/cache/storage_cache_types.h</c>; size encoding mirrors <c>Store::setSize()</c>.
+    /// Size +2 (three uint8), place +5 (seven uint8), checksum +12, key +16, time +32.
+    /// </summary>
+    public static byte[] CompactStore(CacheKey key, int size, uint checksum, PlaceId place, byte tag = 1, bool withTime = true)
+    {
+        var record = new byte[withTime ? 48 : 32];
+        record[0] = 1;
+        record[1] = tag;
+        record[2] = (byte)size; record[3] = (byte)(size >> 8); record[4] = (byte)(size >> 16);
+        place.Bytes.CopyTo(record.AsSpan(5));
+        BinaryPrimitives.WriteUInt32LittleEndian(record.AsSpan(12), checksum);
+        BinaryPrimitives.WriteUInt64LittleEndian(record.AsSpan(16), key.High);
+        BinaryPrimitives.WriteUInt64LittleEndian(record.AsSpan(24), key.Low);
+        if (withTime)
+        {
+            BinaryPrimitives.WriteUInt64LittleEndian(record.AsSpan(32), 1_000);
+            BinaryPrimitives.WriteUInt32LittleEndian(record.AsSpan(40), 1_700_000_000);
+        }
         return record;
     }
 
