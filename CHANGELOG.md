@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Recover orphan place files from cache buckets without exporting indexed values a second time.
+- Apply the CLI per-database file limit to complete streamed files and orphan recovery.
+
 ## [1.1.0] - 2026-11-15
 
 ### Added
