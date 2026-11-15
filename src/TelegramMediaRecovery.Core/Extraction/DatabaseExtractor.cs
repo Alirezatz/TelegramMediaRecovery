@@ -21,7 +21,7 @@ namespace TelegramMediaRecovery.Core.Extraction;
 ///   </description></item>
 ///   <item><description>
 ///     <b><c>media_cache</c></b> &mdash; one file is spread over many entries:
-///     a header slice plus up to 511 data slices. Entries that share a key high are
+///     a header slice plus up to 511 data slices. Entries that share a base file key are
 ///     stitched back together with <see cref="StreamedFilePlanner"/> and written
 ///     with <see cref="StreamedFileWriter"/>, which never materialises a whole
 ///     video in memory.
@@ -44,8 +44,8 @@ internal sealed class DatabaseExtractor(
     CancellationToken token)
 {
     private readonly (string Account, string Database) _label = SplitLabel(label);
-    private readonly HashSet<CacheKey> _claimedKeys = [];
-    private readonly HashSet<string> _claimedPlaces = [];
+    private readonly HashSet<string> _claimedPlaces = new(
+        OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
     private readonly List<ExtractedItem> _writtenThisDatabase = [];
 
     /// <summary>Files recovered by the orphan scan for this database.</summary>
@@ -57,6 +57,7 @@ internal sealed class DatabaseExtractor(
     /// <summary>Extracts a <c>cache</c> database: one entry, one file.</summary>
     public void RunPlain(IReadOnlyList<CacheEntry> entries)
     {
+        ClaimIndexedPlaces(entries);
         var candidates = Filter(entries);
 
         Parallel.ForEach(
@@ -69,11 +70,6 @@ internal sealed class DatabaseExtractor(
             entry =>
             {
                 token.ThrowIfCancellationRequested();
-                lock (_claimedKeys)
-                {
-                    _claimedKeys.Add(entry.Key);
-                }
-
                 var value = reader.Read(entry);
                 if (value is null)
                 {
@@ -88,7 +84,17 @@ internal sealed class DatabaseExtractor(
     /// <summary>Extracts a <c>media_cache</c> database: many entries, one file.</summary>
     public void RunStreaming(IReadOnlyList<CacheEntry> entries)
     {
+        ClaimIndexedPlaces(entries);
         var groups = StreamedFilePlanner.GroupByFile(entries);
+        if (options.MaxFilesPerDatabase > 0 && groups.Count > options.MaxFilesPerDatabase)
+        {
+            foreach (var group in groups.Skip(options.MaxFilesPerDatabase))
+            {
+                Skip(SkipReason.LimitReached, group.Key, string.Empty, 0,
+                    $"the per-database limit is {options.MaxFilesPerDatabase}");
+            }
+            groups = groups.Take(options.MaxFilesPerDatabase).ToArray();
+        }
         var total = groups.Count;
         var done = 0;
 
@@ -104,14 +110,6 @@ internal sealed class DatabaseExtractor(
                 token.ThrowIfCancellationRequested();
 
                 var plan = StreamedFilePlanner.BuildVerifiedPlan(group, entry => reader.Open(entry, token), cancellationToken: token);
-
-                lock (_claimedKeys)
-                {
-                    foreach (var fragment in plan.Fragments)
-                    {
-                        _claimedKeys.Add(fragment.Entry.Key);
-                    }
-                }
 
                 if (!ShouldWriteStream(plan))
                 {
@@ -160,21 +158,10 @@ internal sealed class DatabaseExtractor(
             {
                 token.ThrowIfCancellationRequested();
 
-                counters.OrphanCandidates++;
                 var relative = Path.GetRelativePath(directory, file).Replace(Path.DirectorySeparatorChar, '/');
-                if (!TryParsePlace(relative, out var place))
+                if (!TryParsePlace(relative, out var place) || !_claimedPlaces.Add(place))
                 {
                     continue;
-                }
-
-                lock (_claimedKeys)
-                {
-                    if (_claimedKeys.Contains(new CacheKey(0, 0)) || _claimedPlaces.Contains(relative))
-                    {
-                        continue;
-                    }
-
-                    _claimedPlaces.Add(relative);
                 }
 
                 if (!FileHasTdefMagic(file))
@@ -182,6 +169,7 @@ internal sealed class DatabaseExtractor(
                     continue;
                 }
 
+                counters.OrphanCandidates++;
                 var value = reader.TryReadRaw(file, options.MaxEntrySize);
                 if (value is null || value.Length == 0)
                 {
@@ -208,6 +196,13 @@ internal sealed class DatabaseExtractor(
                     continue;
                 }
 
+                if (options.MaxFilesPerDatabase > 0 && _writtenThisDatabase.Count >= options.MaxFilesPerDatabase)
+                {
+                    Skip(SkipReason.LimitReached, default, relative, value.Length,
+                        $"the per-database limit is {options.MaxFilesPerDatabase}");
+                    continue;
+                }
+
                 var digest = Hash(value);
                 if (!dedup.TryAdd(digest))
                 {
@@ -224,7 +219,7 @@ internal sealed class DatabaseExtractor(
                 counters.BytesWritten += value.Length;
                 recovered++;
 
-                items.Add(new ExtractedItem
+                Track(new ExtractedItem
                 {
                     Account = Account,
                     Database = Database,
@@ -256,17 +251,17 @@ internal sealed class DatabaseExtractor(
     {
         foreach (var bucket in Directory.EnumerateDirectories(directory))
         {
-            if (bucket.Length == directory.Length + 3)
-            {
-                yield return bucket;
-                continue;
-            }
-
             foreach (var file in Directory.EnumerateFiles(bucket))
             {
                 yield return file;
             }
         }
+    }
+
+    private void ClaimIndexedPlaces(IEnumerable<CacheEntry> entries)
+    {
+        // Filters and file limits do not turn indexed values into orphan files.
+        foreach (var entry in entries) { _claimedPlaces.Add(entry.Place.ToRelativePath()); }
     }
 
     private static bool TryParsePlace(string relative, out string place)
