@@ -86,6 +86,65 @@ public sealed class ExtractionBehaviorTests
     }
 
     [Theory]
+    [InlineData(SkipReason.TooSmall, 1)]
+    [InlineData(SkipReason.TooLarge, 1)]
+    [InlineData(SkipReason.MostlyMissing, 1)]
+    [InlineData(SkipReason.PlaceFileMissing, 1)]
+    [InlineData(SkipReason.MostlyMissing, 2)]
+    public void StreamingLimitSkipsIneligibleGroupsBeforeCountingRecoveredFiles(SkipReason reason, int limit)
+    {
+        using var fixture = new RecoveryFixture();
+        var rejected = new CacheKey(0x10000, 1UL << 16);
+        var wave = RecoveryFixture.Wave(1);
+        switch (reason)
+        {
+            case SkipReason.TooSmall:
+                fixture.Add("media_cache", rejected, wave[..128]);
+                break;
+            case SkipReason.PlaceFileMissing:
+                fixture.Add("media_cache", new CacheKey(rejected.High, rejected.Low + 1), wave);
+                break;
+            default:
+                AddStream(fixture, 1, wave);
+                fixture.Add("media_cache", new CacheKey(rejected.High, rejected.Low + 2), wave);
+                break;
+        }
+        for (var number = 2; number <= limit + 2; number++)
+        {
+            AddStream(fixture, number, RecoveryFixture.Wave((byte)number));
+        }
+        fixture.Commit();
+
+        var report = new ExtractionEngine(new ExtractionOptions
+        {
+            OutputDirectory = fixture.Output,
+            MaxFilesPerDatabase = limit,
+            MaxDegreeOfParallelism = 4,
+            MinimumSize = reason == SkipReason.TooSmall ? 1024 : 0,
+            MaximumSize = reason == SkipReason.TooLarge ? wave.Length : 0,
+            MinimumCoverage = reason == SkipReason.MostlyMissing ? 0.5 : 0,
+            RequireStreamHeader = reason == SkipReason.PlaceFileMissing,
+            ScanOrphans = false,
+        }).Run(fixture.Source, LocalKeyLoader.Load(fixture.Source, string.Empty));
+
+        Assert.Equal(limit, report.Items.Count);
+        for (var number = 2; number < limit + 2; number++)
+        {
+            var key = new CacheKey(0x10000, (ulong)number << 16);
+            var item = Assert.Single(report.Items, item => item.Key == key);
+            Assert.Equal(RecoveryFixture.Wave((byte)number), File.ReadAllBytes(item.OutputPath!));
+        }
+        var firstSkip = Assert.Single(report.Skipped, item => item.Key == rejected);
+        Assert.Equal(reason, firstSkip.Reason);
+        if (reason == SkipReason.PlaceFileMissing)
+        {
+            Assert.Contains("the header slice is gone", firstSkip.Detail);
+        }
+        var beyondLimit = new CacheKey(0x10000, (ulong)(limit + 2) << 16);
+        Assert.Equal(SkipReason.LimitReached, Assert.Single(report.Skipped, item => item.Key == beyondLimit).Reason);
+    }
+
+    [Theory]
     [InlineData(0, 3)]
     [InlineData(1, 1)]
     [InlineData(2, 2)]

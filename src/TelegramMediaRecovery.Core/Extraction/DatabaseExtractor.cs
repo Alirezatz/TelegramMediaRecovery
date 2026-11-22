@@ -85,49 +85,59 @@ internal sealed class DatabaseExtractor(
     public void RunStreaming(IReadOnlyList<CacheEntry> entries)
     {
         ClaimIndexedPlaces(entries);
+        token.ThrowIfCancellationRequested();
         var groups = StreamedFilePlanner.GroupByFile(entries);
-        if (options.MaxFilesPerDatabase > 0 && groups.Count > options.MaxFilesPerDatabase)
-        {
-            foreach (var group in groups.Skip(options.MaxFilesPerDatabase))
-            {
-                Skip(SkipReason.LimitReached, group.Key, string.Empty, 0,
-                    $"the per-database limit is {options.MaxFilesPerDatabase}");
-            }
-            groups = groups.Take(options.MaxFilesPerDatabase).ToArray();
-        }
         var total = groups.Count;
+        var limit = options.MaxFilesPerDatabase;
         var done = 0;
+        var next = 0;
+        var parallelOptions = new ParallelOptions
+        {
+            MaxDegreeOfParallelism = Degree(),
+            CancellationToken = token,
+        };
 
-        Parallel.ForEach(
-            groups,
-            new ParallelOptions
+        while (next < total)
+        {
+            // A batch can write at most one file per group. Once its workers finish,
+            // the count reflects which slots are still available for later groups.
+            var remaining = total - next;
+            var capacity = limit > 0 ? limit - _writtenThisDatabase.Count : remaining;
+            if (capacity <= 0) { break; }
+
+            var batchSize = Math.Min(capacity, remaining);
+            Parallel.ForEach(groups.Skip(next).Take(batchSize), parallelOptions, ProcessGroup);
+            next += batchSize;
+        }
+
+        foreach (var group in groups.Skip(next))
+        {
+            token.ThrowIfCancellationRequested();
+            Skip(SkipReason.LimitReached, group.Key, string.Empty, 0, $"the per-database limit is {limit}");
+        }
+
+        void ProcessGroup(IGrouping<CacheKey, CacheEntry> group)
+        {
+            token.ThrowIfCancellationRequested();
+            var plan = StreamedFilePlanner.BuildVerifiedPlan(group, entry => reader.Open(entry, token), cancellationToken: token);
+
+            if (!ShouldWriteStream(plan))
             {
-                MaxDegreeOfParallelism = Degree(),
-                CancellationToken = token,
-            },
-            group =>
+                RecordStreamSkip(plan);
+            }
+            else
             {
-                token.ThrowIfCancellationRequested();
+                WriteStream(plan);
+            }
 
-                var plan = StreamedFilePlanner.BuildVerifiedPlan(group, entry => reader.Open(entry, token), cancellationToken: token);
-
-                if (!ShouldWriteStream(plan))
-                {
-                    RecordStreamSkip(plan);
-                }
-                else
-                {
-                    WriteStream(plan);
-                }
-
-                var completed = Interlocked.Increment(ref done);
-                if (completed % 64 == 0)
-                {
-                    options.Progress?.Report(new ExtractionProgress(
-                        label, counters.EntriesSeen, counters.FilesWritten, counters.BytesWritten,
-                        counters.SkippedTotal, completed, total));
-                }
-            });
+            var completed = Interlocked.Increment(ref done);
+            if (completed % 64 == 0)
+            {
+                options.Progress?.Report(new ExtractionProgress(
+                    label, counters.EntriesSeen, counters.FilesWritten, counters.BytesWritten,
+                    counters.SkippedTotal, completed, total));
+            }
+        }
     }
 
     /// <summary>
